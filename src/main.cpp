@@ -164,6 +164,17 @@ struct App {
     std::string message;  // one-off feedback, cleared on the next key
     bool show_help = false;
     int rows = 10;        // visible list rows; updated every draw
+    int cols = 120;       // screen width; updated every draw
+    // Panes that fit side by side: 3 when wide, 2 on a small window,
+    // 1 on a phone. The visible ones slide along to follow the active pane.
+    int shown = 3;        // how many panes are visible
+    int first_shown = 0;  // leftmost visible pane
+    bool visible(Pane p) const {
+        int i = static_cast<int>(p);
+        return i >= first_shown && i < first_shown + shown;
+    }
+    // The rightmost visible pane stretches; the others keep fixed widths.
+    bool stretches(Pane p) const { return static_cast<int>(p) == first_shown + shown - 1; }
     int count = 0;        // vim count prefix, e.g. the 5 in 5j
     char pending = 0;     // first key of gg / yy / dd
     int pending_count = 0;
@@ -1339,7 +1350,7 @@ struct App {
                          text(" " + plural(n, "artist")), [&](int i) {
             if (i == kPlaylists) return text(" " + artists[i] + " ") | color(Color::Cyan);
             return text(" " + artists[i] + " ");
-        }) | size(WIDTH, EQUAL, 24);
+        }) | (stretches(Pane::Artists) ? flex : size(WIDTH, EQUAL, 24));
     }
 
     Element draw_groups() {
@@ -1364,14 +1375,20 @@ struct App {
                                 text(" Press A on a song to add") | dim, text(" it to a new playlist, or") | dim,
                                 text(" type :new Name") | dim}) | flex);
         }
-        return body | size(WIDTH, EQUAL, 30);
+        return body | (stretches(Pane::Albums) ? flex : size(WIDTH, EQUAL, 30));
     }
 
     Element draw_songs() {
-        auto columns = [](Element mark, Element title, Element artist, Element album, Element time) {
-            return hbox({mark | size(WIDTH, EQUAL, 2), title | flex, text(" "),
-                         artist | size(WIDTH, EQUAL, 18), text(" "),
-                         album | size(WIDTH, EQUAL, 18), time | align_right | size(WIDTH, EQUAL, 6)});
+        // Drop the album, then the artist column when there isn't room,
+        // so the title always gets space.
+        int inner = cols - 2 - (visible(Pane::Artists) ? 24 : 0) - (visible(Pane::Albums) ? 30 : 0);
+        bool show_album = inner >= 70, show_artist = inner >= 45;
+        auto columns = [=](Element mark, Element title, Element artist, Element album, Element time) {
+            Elements cells = {mark | size(WIDTH, EQUAL, 2), title | flex};
+            if (show_artist) cells.insert(cells.end(), {text(" "), artist | size(WIDTH, EQUAL, 18)});
+            if (show_album) cells.insert(cells.end(), {text(" "), album | size(WIDTH, EQUAL, 18)});
+            cells.push_back(time | align_right | size(WIDTH, EQUAL, 6));
+            return hbox(std::move(cells));
         };
         Element header = columns(text(""), text("Title"), text("Artist"), text("Album"), text("Time"));
 
@@ -1574,10 +1591,25 @@ struct App {
     Element draw() {
         // Rows left for list items: screen minus now-playing (4), status (1),
         // the panes' borders (2) and their header row (1).
-        rows = std::max(1, Terminal::Size().dimy - 8);
+        auto term = Terminal::Size();
+        rows = std::max(1, term.dimy - 8);
+        cols = term.dimx;
+
+        // Fit as many panes as the width allows, then slide the window of
+        // visible panes just far enough to keep the active one on screen.
+        shown = cols >= 100 ? 3 : cols >= 65 ? 2 : 1;
+        int active = static_cast<int>(pane);
+        first_shown = std::clamp(first_shown, active - shown + 1, active);
+        first_shown = std::clamp(first_shown, 0, 3 - shown);
+
+        Elements visible_panes;
+        if (visible(Pane::Artists)) visible_panes.push_back(draw_artists());
+        if (visible(Pane::Albums)) visible_panes.push_back(draw_groups());
+        if (visible(Pane::Songs)) visible_panes.push_back(draw_songs());
+        Element panes = hbox(std::move(visible_panes));
 
         Element main = vbox({
-            hbox({draw_artists(), draw_groups(), draw_songs()}) | flex,
+            panes | flex,
             draw_now_playing(),
             draw_status(),
         });

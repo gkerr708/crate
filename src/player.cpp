@@ -48,7 +48,10 @@ static std::string json_field(const std::string& line, const std::string& key) {
 }
 
 Player::Player(std::function<void()> on_change) : on_change_(std::move(on_change)) {
+    // Where to put the socket: XDG_RUNTIME_DIR on a desktop, else TMPDIR
+    // (set by Termux on Android, which has no /tmp), else /tmp.
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (!runtime) runtime = std::getenv("TMPDIR");
     socket_path_ = std::string(runtime ? runtime : "/tmp") + "/crate-mpv-" +
                    std::to_string(getpid()) + ".sock";
 

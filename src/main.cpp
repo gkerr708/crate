@@ -173,6 +173,10 @@ struct App {
         int i = static_cast<int>(p);
         return i >= first_shown && i < first_shown + shown;
     }
+    // Where each pane and the now-playing box landed on screen last draw,
+    // so a tap can be matched to what's under it.
+    Box pane_box[3];
+    Box now_box;
     // The rightmost visible pane stretches; the others keep fixed widths.
     bool stretches(Pane p) const { return static_cast<int>(p) == first_shown + shown - 1; }
     int count = 0;        // vim count prefix, e.g. the 5 in 5j
@@ -1207,10 +1211,53 @@ struct App {
         return handled;
     }
 
+    // Taps and clicks: tap a song to play it; tap an artist or album to
+    // select it, and tap it again to open it. Swiping scrolls the list
+    // under your finger; tapping the now-playing box pauses.
+    bool on_mouse(Event e) {
+        Mouse& m = e.mouse();
+        bool tap = m.button == Mouse::Left && m.motion == Mouse::Pressed;
+        bool wheel = m.button == Mouse::WheelUp || m.button == Mouse::WheelDown;
+        if (!tap && !wheel) return false;  // ignore moves and releases
+        if (mode != Mode::Normal) return false;
+        if (show_help) {
+            if (tap) show_help = false;
+            return true;
+        }
+        if (tap && now_box.Contain(m.x, m.y)) {
+            player.toggle_pause();
+            return true;
+        }
+        for (int p = 0; p < 3; ++p) {
+            if (!visible(static_cast<Pane>(p)) || !pane_box[p].Contain(m.x, m.y)) continue;
+            bool was_active = pane == static_cast<Pane>(p);
+            if (!was_active) set_pane(p);
+            if (wheel) {
+                move_to(cur().sel + (m.button == Mouse::WheelDown ? 1 : -1));
+                return true;
+            }
+            // Rows start below the top border and the header line.
+            int index = cur().top + (m.y - pane_box[p].y_min - 2);
+            if (m.y < pane_box[p].y_min + 2 || m.y >= pane_box[p].y_max || index >= list_size()) return true;
+            message.clear();
+            if (pane == Pane::Songs) {
+                song_cur.sel = index;
+                play_from_list(index);
+            } else if (was_active && index == cur().sel) {
+                set_pane(p + 1);  // second tap opens it
+            } else {
+                move_to(index);
+            }
+            return true;
+        }
+        return false;
+    }
+
     bool handle_event(const Event& e) {
         if (player.take_finished()) next();
         check_download();
         if (e == Event::Custom) return true;  // just a redraw request from a background thread
+        if (e.is_mouse()) return on_mouse(e);
 
         if (mode == Mode::Tag) return on_form_key(e);
         if (mode == Mode::Pick) return on_pick_key(e);
@@ -1603,14 +1650,14 @@ struct App {
         first_shown = std::clamp(first_shown, 0, 3 - shown);
 
         Elements visible_panes;
-        if (visible(Pane::Artists)) visible_panes.push_back(draw_artists());
-        if (visible(Pane::Albums)) visible_panes.push_back(draw_groups());
-        if (visible(Pane::Songs)) visible_panes.push_back(draw_songs());
+        if (visible(Pane::Artists)) visible_panes.push_back(draw_artists() | reflect(pane_box[0]));
+        if (visible(Pane::Albums)) visible_panes.push_back(draw_groups() | reflect(pane_box[1]));
+        if (visible(Pane::Songs)) visible_panes.push_back(draw_songs() | reflect(pane_box[2]));
         Element panes = hbox(std::move(visible_panes));
 
         Element main = vbox({
             panes | flex,
-            draw_now_playing(),
+            draw_now_playing() | reflect(now_box),
             draw_status(),
         });
         if (mode == Mode::Tag) return dbox({main, draw_form()});

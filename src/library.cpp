@@ -20,9 +20,10 @@ std::string lower(std::string s) {
 
 std::string format_time(int seconds) {
     if (seconds <= 0) return "-:--";
-    int m = seconds / 60;
-    int s = seconds % 60;
-    return std::to_string(m) + ":" + (s < 10 ? "0" : "") + std::to_string(s);
+    auto two = [](int n) { return (n < 10 ? "0" : "") + std::to_string(n); };
+    int h = seconds / 3600, m = seconds / 60 % 60, s = seconds % 60;
+    if (h > 0) return std::to_string(h) + ":" + two(m) + ":" + two(s);  // 1:05:09
+    return std::to_string(m) + ":" + two(s);                            // 3:07
 }
 
 static bool is_audio(const fs::path& p) {

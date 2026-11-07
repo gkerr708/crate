@@ -18,7 +18,7 @@ FetchContent_MakeAvailable(ftxui)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(TAGLIB REQUIRED IMPORTED_TARGET taglib)
 
-add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp)
+add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp src/progress.cpp)
 target_compile_options(crate PRIVATE -Wall -Wextra)
 target_link_libraries(crate PRIVATE
     ftxui::screen ftxui::dom ftxui::component

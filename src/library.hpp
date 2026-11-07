@@ -37,7 +37,7 @@ bool move_to_trash(const std::filesystem::path& path, std::string& error);
 // Makes a string safe to use as a file or folder name.
 std::string safe_filename(std::string s);
 
-// "3:07" style time. Negative or zero gives "-:--".
+// "3:07" style time, or "1:05:09" past an hour. Negative or zero gives "-:--".
 std::string format_time(int seconds);
 
 // Lowercase copy, for case-insensitive comparisons and searching.

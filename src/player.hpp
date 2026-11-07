@@ -28,13 +28,17 @@ public:
 
     bool ok() const { return fd_ >= 0; }  // false if mpv failed to start
 
-    void play(const std::string& path);
+    // Plays `path`, starting `start` seconds in.
+    void play(const std::string& path, double start = 0);
     void stop();
     void toggle_pause();
     void seek(double seconds);  // relative, e.g. -5 or +10
     void change_volume(int delta);
 
     double position() const { return position_; }
+    // True from play() until mpv has opened the file; position() is the
+    // requested start time until then, not a real reading.
+    bool loading() const { return loading_; }
     double duration() const { return duration_; }
     bool paused() const { return paused_; }
     int volume() const { return static_cast<int>(volume_); }
@@ -61,4 +65,5 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<double> volume_{70};
     std::atomic<bool> finished_{false};
+    std::atomic<bool> loading_{false};
 };

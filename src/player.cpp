@@ -126,9 +126,16 @@ void Player::send(const std::string& json) {
     ::send(fd_, line.data(), line.size(), MSG_NOSIGNAL);
 }
 
-void Player::play(const std::string& path) {
+void Player::play(const std::string& path, double start) {
     finished_ = false;
-    send(R"({"command":["loadfile",)" + json_string(path) + R"(,"replace"]})");
+    // Until mpv reports the new file loaded, ignore position updates: late
+    // ones from the previous file would otherwise look like this file's.
+    loading_ = true;
+    position_ = start;
+    std::string cmd = R"({"command":["loadfile",)" + json_string(path) + R"(,"replace")";
+    // loadfile <path> <flags> <index> <options>: -1 = no playlist index (mpv 0.38+).
+    if (start > 0) cmd += R"(,-1,"start=)" + std::to_string(static_cast<int>(start)) + R"(")";
+    send(cmd + "]}");
     send(R"({"command":["set_property","pause",false]})");
 }
 
@@ -169,6 +176,7 @@ void Player::handle_line(const std::string& line) {
         double value = (data.empty() || data == "null") ? 0 : std::atof(data.c_str());
 
         if (name == "time-pos") {
+            if (loading_) return;
             // time-pos changes many times a second; only redraw when the
             // displayed whole second actually changes.
             bool new_second = std::floor(value) != std::floor(position_.load());
@@ -182,6 +190,8 @@ void Player::handle_line(const std::string& line) {
             volume_ = value;
         }
         on_change_();
+    } else if (event == "file-loaded") {
+        loading_ = false;
     } else if (event == "end-file" && json_field(line, "reason") == "eof") {
         finished_ = true;
         position_ = 0;

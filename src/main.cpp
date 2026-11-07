@@ -45,6 +45,7 @@
 #include "library.hpp"
 #include "manifest.hpp"
 #include "player.hpp"
+#include "progress.hpp"
 #include "playlist.hpp"
 
 using namespace ftxui;
@@ -217,6 +218,12 @@ struct App {
     bool shuffle = false;
     std::mt19937 rng{std::random_device{}()};
 
+    // --- progress.tsv: where you stopped in long tracks ---
+    ProgressMap progress;
+    bool progress_dirty = false;  // changed since it was last written
+    std::chrono::steady_clock::time_point progress_written{};
+    bool was_paused = false;
+
     // =================================================================
     // Library: building the three panes
     // =================================================================
@@ -227,6 +234,7 @@ struct App {
         track_index.clear();
         for (int i = 0; i < static_cast<int>(tracks.size()); ++i) track_index[tracks[i].path.string()] = i;
         playlists = load_playlists(dir);
+        progress = read_progress(dir);
 
         build_artists();
         build_groups();
@@ -416,9 +424,62 @@ struct App {
     // =================================================================
     // Playback
     // =================================================================
+    // Long tracks (podcasts, audiobooks) remember where you stopped.
+    bool is_long(int track) const { return tracks[track].seconds >= kLongTrack; }
+
+    const Progress* progress_of(int track) const {
+        auto it = progress.find(rel(tracks[track].path));
+        return it == progress.end() ? nullptr : &it->second;
+    }
+
+    // Record where we are in the playing track, if it's a long one.
+    void note_progress() {
+        if (playing < 0 || !is_long(playing) || player.loading()) return;
+        int pos = static_cast<int>(player.position());
+        if (pos <= 0) return;
+        Progress& p = progress[rel(tracks[playing].path)];
+        // Stopping in the last 30 seconds counts as finished.
+        Progress now = tracks[playing].seconds - pos < 30 ? Progress{0, true} : Progress{pos, false};
+        if (now.seconds == p.seconds && now.done == p.done) return;
+        p = now;
+        progress_dirty = true;
+    }
+
+    // Write progress.tsv: right away if `now`, else at most every 15 seconds.
+    void save_progress(bool now) {
+        auto t = std::chrono::steady_clock::now();
+        if (!progress_dirty || (!now && t - progress_written < std::chrono::seconds(15))) return;
+        if (!write_progress(dir, progress)) message = "Couldn't write progress.tsv";
+        progress_dirty = false;
+        progress_written = t;
+    }
+
     void start(int track) {
+        note_progress();  // remember where we left the previous one
+        save_progress(true);
         playing = track;
-        player.play(tracks[track].path.string());
+        // Resume a long track where you stopped, backing up a few seconds
+        // to catch the thread again. Finished ones start over.
+        double from = 0;
+        if (const Progress* p = progress_of(track); is_long(track) && p && !p->done && p->seconds > 10) {
+            from = p->seconds - 5;
+        }
+        player.play(tracks[track].path.string(), from);
+    }
+
+    // A track played to its end on its own.
+    void finished() {
+        if (playing >= 0 && is_long(playing)) {
+            progress[rel(tracks[playing].path)] = {0, true};
+            progress_dirty = true;
+        }
+        next();
+    }
+
+    // Called once on quit.
+    void shutdown() {
+        note_progress();
+        save_progress(true);
     }
 
     // Enter on a song: play through the current list starting there.
@@ -1305,7 +1366,12 @@ struct App {
     }
 
     bool handle_event(const Event& e) {
-        if (player.take_finished()) next();
+        if (player.take_finished()) finished();
+        note_progress();
+        // Save when you pause, so closing the app (or the phone killing it) loses nothing.
+        bool paused_now = player.paused();
+        save_progress(paused_now != was_paused);
+        was_paused = paused_now;
         check_download();
         if (e == Event::Custom) return true;  // just a redraw request from a background thread
         if (e.is_mouse()) return on_mouse(e);
@@ -1485,7 +1551,7 @@ struct App {
             Elements cells = {mark | size(WIDTH, EQUAL, 2), title | flex};
             if (show_artist) cells.insert(cells.end(), {text(" "), artist | size(WIDTH, EQUAL, 18)});
             if (show_album) cells.insert(cells.end(), {text(" "), album | size(WIDTH, EQUAL, 18)});
-            cells.push_back(time | align_right | size(WIDTH, EQUAL, 6));
+            cells.push_back(time | align_right | size(WIDTH, EQUAL, 9));  // fits "-12:34:56"
             return hbox(std::move(cells));
         };
         Element header = columns(text(""), text("Title"), text("Artist"), text("Album"), text("Time"));
@@ -1509,9 +1575,16 @@ struct App {
                               std::find(restore_queue.begin(), restore_queue.end(), r) != restore_queue.end();
                 mark = queued ? "…" : "⇣";
             }
-            Element row = columns(text(mark), text(t.title), text(t.artist),
-                                  text(t.album), text(format_time(t.seconds)));
-            if (t.missing) return row | dim;
+            // Long tracks: ◐ part-way (showing time left), ✓ finished.
+            std::string time = format_time(t.seconds);
+            bool done = false;
+            if (const Progress* p = progress_of(songs[i]); p && is_long(songs[i])) {
+                done = p->done;
+                if (mark.empty()) mark = p->done ? "✓" : p->seconds > 0 ? "◐" : "";
+                if (!p->done && p->seconds > 0) time = "-" + format_time(t.seconds - p->seconds);
+            }
+            Element row = columns(text(mark), text(t.title), text(t.artist), text(t.album), text(time));
+            if (t.missing || (done && !is_playing)) return row | dim;
             return is_playing ? row | color(Color::Green) : row;
         }, [&](int i) { return i >= lo && i <= hi; }) | flex;
     }
@@ -1748,4 +1821,5 @@ int main(int argc, char** argv) {
     auto ui = Renderer([&] { return app.draw(); });
     ui |= CatchEvent([&](Event e) { return app.on_event(e); });
     screen.Loop(ui);
+    app.shutdown();
 }

@@ -34,6 +34,7 @@ public:
     void toggle_pause();
     void seek(double seconds);  // relative, e.g. -5 or +10
     void change_volume(int delta);
+    void set_speed(double speed);  // 1 = normal; pitch stays the same
 
     double position() const { return position_; }
     // True from play() until mpv has opened the file; position() is the

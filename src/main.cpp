@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -98,6 +99,20 @@ static fs::path incoming_dir() {
     const char* cache = std::getenv("XDG_CACHE_HOME");
     fs::path base = cache ? fs::path(cache) : fs::path(std::getenv("HOME")) / ".cache";
     return base / "crate" / "incoming";
+}
+
+// Settings kept per computer: ~/.local/state/crate/<name>
+static fs::path state_file(const std::string& name) {
+    const char* state = std::getenv("XDG_STATE_HOME");
+    fs::path base = state ? fs::path(state) : fs::path(std::getenv("HOME")) / ".local" / "state";
+    return base / "crate" / name;
+}
+
+// "1.5×" style speed.
+static std::string format_speed(double speed) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%g×", speed);
+    return buf;
 }
 
 // What's on the Wayland clipboard, if it looks like a URL.
@@ -224,6 +239,10 @@ struct App {
     std::chrono::steady_clock::time_point progress_written{};
     bool was_paused = false;
 
+    // Playback speed for long tracks; music always plays at normal speed.
+    // Remembered per computer in ~/.local/state/crate/speed.
+    double long_speed = 1.0;
+
     // =================================================================
     // Library: building the three panes
     // =================================================================
@@ -235,6 +254,11 @@ struct App {
         for (int i = 0; i < static_cast<int>(tracks.size()); ++i) track_index[tracks[i].path.string()] = i;
         playlists = load_playlists(dir);
         progress = read_progress(dir);
+        if (FILE* f = std::fopen(state_file("speed").c_str(), "r")) {
+            double s = 0;
+            if (std::fscanf(f, "%lf", &s) == 1 && s >= 0.5 && s <= 3) long_speed = s;
+            std::fclose(f);
+        }
 
         build_artists();
         build_groups();
@@ -465,6 +489,20 @@ struct App {
             from = p->seconds - 5;
         }
         player.play(tracks[track].path.string(), from);
+        player.set_speed(is_long(track) ? long_speed : 1.0);
+    }
+
+    // < / > and :speed. Applies to long tracks only (podcasts, audiobooks).
+    void set_long_speed(double speed) {
+        long_speed = std::clamp(std::round(speed * 100) / 100, 0.5, 3.0);
+        if (playing >= 0 && is_long(playing)) player.set_speed(long_speed);
+        message = "Speed " + format_speed(long_speed) + " for podcasts and other long tracks";
+        std::error_code ec;
+        fs::create_directories(state_file("speed").parent_path(), ec);
+        if (FILE* f = std::fopen(state_file("speed").c_str(), "w")) {
+            std::fprintf(f, "%g\n", long_speed);
+            std::fclose(f);
+        }
     }
 
     // A track played to its end on its own.
@@ -1227,6 +1265,11 @@ struct App {
             message = "Found " + plural(tracks.size(), "song");
         }
         else if (verb == "shuffle") toggle_shuffle();
+        else if (verb == "speed") {
+            double s = std::atof(arg.c_str());
+            if (s > 0) set_long_speed(s);
+            else message = "Usage: :speed 1.5  (0.5 to 3)";
+        }
         else if (verb == "help") show_help = true;
         else if (verb == "new") new_playlist(arg);
         else if (verb == "rename") rename_playlist(arg);
@@ -1457,6 +1500,8 @@ struct App {
         else if (c == "+" || c == "=") player.change_volume(5 * n);
         else if (c == "-") player.change_volume(-5 * n);
         else if (c == "s") toggle_shuffle();
+        else if (c == ">") set_long_speed(long_speed + 0.25 * n);
+        else if (c == "<") set_long_speed(long_speed - 0.25 * n);
 
         // --- playlists (vim-style: yank, delete, put) ---
         else if (c == "V") songs_only([&] { visual = (visual >= 0 || songs.empty()) ? -1 : song_cur.sel; });
@@ -1605,7 +1650,9 @@ struct App {
                            gauge(progress) | color(Color::Green) | flex,
                            text(" " + format_time((int)len) + " ")});
         }
-        std::string flags = " vol " + std::to_string(player.volume()) + "%" +
+        bool sped = playing >= 0 && is_long(playing) && long_speed != 1.0;
+        std::string flags = (sped ? " " + format_speed(long_speed) + " " : "") +
+                            " vol " + std::to_string(player.volume()) + "%" +
                             (shuffle ? "  shuffle" : "") + " ";
         return window(text(" Now playing ") | dim,
                       vbox({hbox({top | flex, text(flags) | dim}), bottom}));
@@ -1734,6 +1781,7 @@ struct App {
             line("] / [", "next / previous song"),
             line("← / →  { / }", "seek 5s / 30s"),
             line("+ / -   s", "volume   shuffle"),
+            line("> / <  :speed 1.5", "faster / slower (podcasts only)"),
             heading("Library"),
             line("a / e", "add song from URL / edit tags"),
             line("dd", "delete song / album / artist (asks; goes to trash)"),

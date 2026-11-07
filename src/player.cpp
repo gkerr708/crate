@@ -146,6 +146,10 @@ void Player::seek(double seconds) {
     send(R"({"command":["seek",)" + std::to_string(seconds) + R"(,"relative"]})");
 }
 
+void Player::set_speed(double speed) {
+    send(R"({"command":["set_property","speed",)" + std::to_string(speed) + "]}");
+}
+
 void Player::change_volume(int delta) {
     send(R"({"command":["add","volume",)" + std::to_string(delta) + "]}");
 }

@@ -182,12 +182,12 @@ struct App {
     // so a tap can be matched to what's under it.
     Box pane_box[3];
     Box now_box;
-    // Counting taps, to tell a double tap from a triple tap.
+    // Counting taps, to tell a single tap from a double tap.
     std::chrono::steady_clock::time_point last_tap{};
     int last_tap_y = -100;
     int taps = 0;
-    int tap_id = 0;          // bumped to cancel a pending double-tap action
-    std::jthread tap_timer;  // waits briefly after a double tap for a third
+    int tap_id = 0;          // bumped to cancel a pending single-tap action
+    std::jthread tap_timer;  // waits briefly after a tap for a second one
     // The rightmost visible pane stretches; the others keep fixed widths.
     bool stretches(Pane p) const { return static_cast<int>(p) == first_shown + shown - 1; }
     int count = 0;        // vim count prefix, e.g. the 5 in 5j
@@ -1222,13 +1222,13 @@ struct App {
         return handled;
     }
 
-    // Touch / mouse. Taps are hard to aim on a phone, so a single tap does
-    // nothing. Swipe to move the selection, then:
-    //   double tap: play the selected song (or pause it if it's the one
+    // Touch / mouse. Taps are hard to aim on a phone, so they act on the
+    // selected row wherever they land. Swipe to move the selection, then:
+    //   tap:        play the selected song (or pause it if it's the one
     //               playing), or open the selected artist / album;
     //               on the now-playing box, pause
-    //   triple tap: go back one pane
-    // A double tap waits a moment before acting, in case a third tap follows.
+    //   double tap: go back one pane
+    // A tap waits a moment before acting, in case it becomes a double tap.
     static constexpr auto kTapGap = std::chrono::milliseconds(350);
 
     int pane_at(int x, int y) const {
@@ -1237,7 +1237,7 @@ struct App {
         return -1;
     }
 
-    void on_double_tap(int x, int y) {
+    void on_tap(int x, int y) {
         if (show_help) {
             show_help = false;
             return;
@@ -1279,8 +1279,8 @@ struct App {
         last_tap = now;
         last_tap_y = m.y;
 
-        if (taps == 2) {
-            // Act after a pause, unless a third tap cancels it first.
+        if (taps == 1) {
+            // Act after a pause, unless a second tap cancels it first.
             int id = ++tap_id, x = m.x, y = m.y;
             tap_timer = std::jthread([this, id, x, y](std::stop_token stop) {
                 std::mutex mu;
@@ -1289,21 +1289,19 @@ struct App {
                 cv.wait_for(lock, stop, kTapGap, [] { return false; });
                 if (stop.stop_requested()) return;
                 screen.Post([this, id, x, y] {
-                    if (id == tap_id) on_double_tap(x, y);
+                    if (id == tap_id) on_tap(x, y);
                 });
                 screen.PostEvent(Event::Custom);  // redraw
             });
             return false;
         }
-        if (taps == 3) {
-            ++tap_id;  // cancel the double tap
-            tap_timer.request_stop();
-            taps = 0;
-            if (show_help) show_help = false;
-            else set_pane(static_cast<int>(pane) - 1);
-            return true;
-        }
-        return false;
+        // Double tap: cancel the pending tap and go back a pane.
+        ++tap_id;
+        tap_timer.request_stop();
+        taps = 0;
+        if (show_help) show_help = false;
+        else set_pane(static_cast<int>(pane) - 1);
+        return true;
     }
 
     bool handle_event(const Event& e) {

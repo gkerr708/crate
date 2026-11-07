@@ -21,13 +21,17 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <random>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -178,9 +182,12 @@ struct App {
     // so a tap can be matched to what's under it.
     Box pane_box[3];
     Box now_box;
-    // The last tap, to spot a double tap.
+    // Counting taps, to tell a double tap from a triple tap.
     std::chrono::steady_clock::time_point last_tap{};
     int last_tap_y = -100;
+    int taps = 0;
+    int tap_id = 0;          // bumped to cancel a pending double-tap action
+    std::jthread tap_timer;  // waits briefly after a double tap for a third
     // The rightmost visible pane stretches; the others keep fixed widths.
     bool stretches(Pane p) const { return static_cast<int>(p) == first_shown + shown - 1; }
     int count = 0;        // vim count prefix, e.g. the 5 in 5j
@@ -1216,10 +1223,39 @@ struct App {
     }
 
     // Touch / mouse. Taps are hard to aim on a phone, so a single tap does
-    // nothing; swipe to move the selection, then double-tap anywhere in a
-    // pane to act on the selected row: play the song (or pause it if it's
-    // the one playing), or open the artist / album. Double-tapping the
-    // now-playing box pauses.
+    // nothing. Swipe to move the selection, then:
+    //   double tap: play the selected song (or pause it if it's the one
+    //               playing), or open the selected artist / album;
+    //               on the now-playing box, pause
+    //   triple tap: go back one pane
+    // A double tap waits a moment before acting, in case a third tap follows.
+    static constexpr auto kTapGap = std::chrono::milliseconds(350);
+
+    int pane_at(int x, int y) const {
+        for (int p = 0; p < 3; ++p)
+            if (visible(static_cast<Pane>(p)) && pane_box[p].Contain(x, y)) return p;
+        return -1;
+    }
+
+    void on_double_tap(int x, int y) {
+        if (show_help) {
+            show_help = false;
+            return;
+        }
+        if (mode != Mode::Normal) return;
+        message.clear();
+        if (now_box.Contain(x, y)) {
+            player.toggle_pause();
+            return;
+        }
+        int p = pane_at(x, y);
+        if (p < 0) return;
+        set_pane(p);
+        if (pane != Pane::Songs) set_pane(p + 1);  // open the selected artist / album
+        else if (!songs.empty() && songs[song_cur.sel] == playing) player.toggle_pause();
+        else if (!songs.empty()) play_from_list(song_cur.sel);
+    }
+
     bool on_mouse(Event e) {
         Mouse& m = e.mouse();
         bool tap = m.button == Mouse::Left && m.motion == Mouse::Pressed;
@@ -1227,44 +1263,47 @@ struct App {
         if (!tap && !wheel) return false;  // ignore moves and releases
         if (mode != Mode::Normal) return false;
 
-        auto pane_at = [&]() -> int {
-            for (int p = 0; p < 3; ++p)
-                if (visible(static_cast<Pane>(p)) && pane_box[p].Contain(m.x, m.y)) return p;
-            return -1;
-        };
-
         if (wheel) {
-            int p = pane_at();
+            int p = pane_at(m.x, m.y);
             if (show_help || p < 0) return false;
             set_pane(p);
             move_to(cur().sel + (m.button == Mouse::WheelDown ? 1 : -1));
             return true;
         }
 
-        // A double tap is two taps within 400ms, a few rows apart at most
-        // (fingers wander).
+        // Taps count as one gesture when they come quickly, a few rows
+        // apart at most (fingers wander).
         auto now = std::chrono::steady_clock::now();
-        bool double_tap = now - last_tap < std::chrono::milliseconds(400) && std::abs(m.y - last_tap_y) <= 3;
-        last_tap = double_tap ? std::chrono::steady_clock::time_point{} : now;  // a third tap starts over
+        bool follows = now - last_tap < kTapGap && std::abs(m.y - last_tap_y) <= 3;
+        taps = follows ? taps + 1 : 1;
+        last_tap = now;
         last_tap_y = m.y;
-        if (!double_tap) return false;
 
-        if (show_help) {
-            show_help = false;
+        if (taps == 2) {
+            // Act after a pause, unless a third tap cancels it first.
+            int id = ++tap_id, x = m.x, y = m.y;
+            tap_timer = std::jthread([this, id, x, y](std::stop_token stop) {
+                std::mutex mu;
+                std::condition_variable_any cv;
+                std::unique_lock lock(mu);
+                cv.wait_for(lock, stop, kTapGap, [] { return false; });
+                if (stop.stop_requested()) return;
+                screen.Post([this, id, x, y] {
+                    if (id == tap_id) on_double_tap(x, y);
+                });
+                screen.PostEvent(Event::Custom);  // redraw
+            });
+            return false;
+        }
+        if (taps == 3) {
+            ++tap_id;  // cancel the double tap
+            tap_timer.request_stop();
+            taps = 0;
+            if (show_help) show_help = false;
+            else set_pane(static_cast<int>(pane) - 1);
             return true;
         }
-        message.clear();
-        if (now_box.Contain(m.x, m.y)) {
-            player.toggle_pause();
-            return true;
-        }
-        int p = pane_at();
-        if (p < 0) return false;
-        set_pane(p);
-        if (pane != Pane::Songs) set_pane(p + 1);  // open the selected artist / album
-        else if (!songs.empty() && songs[song_cur.sel] == playing) player.toggle_pause();
-        else if (!songs.empty()) play_from_list(song_cur.sel);
-        return true;
+        return false;
     }
 
     bool handle_event(const Event& e) {

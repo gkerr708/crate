@@ -18,9 +18,18 @@ FetchContent_MakeAvailable(ftxui)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(TAGLIB REQUIRED IMPORTED_TARGET taglib)
 
-add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp src/progress.cpp)
+# --- libpulse (records the audio output for the visualizer): optional ---
+# Works on PipeWire too, through pipewire-pulse. Without it, crate still builds;
+# the visualizer just says it's unavailable.
+pkg_check_modules(PULSE IMPORTED_TARGET libpulse-simple)
+
+add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp src/progress.cpp src/visualizer.cpp)
 target_compile_options(crate PRIVATE -Wall -Wextra)
 target_link_libraries(crate PRIVATE
     ftxui::screen ftxui::dom ftxui::component
     PkgConfig::TAGLIB
 )
+if(PULSE_FOUND)
+    target_link_libraries(crate PRIVATE PkgConfig::PULSE)
+    target_compile_definitions(crate PRIVATE CRATE_HAVE_PULSE)
+endif()

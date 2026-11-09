@@ -1,7 +1,8 @@
 // crate: a vim-flavoured music library and player for the terminal.
 //
 // Layout:  [ Artists ][ Albums ][ Songs ............................ ]
-//          [ now playing + progress bar                               ]
+//          [ big spectrum with frequency axis (b, off by default)     ]
+//          [ now playing (i) ][ mini spectrum (v) ................... ]
 //          NORMAL  status / search / command line
 //
 // "♫ Playlists" is listed with the artists. Select it and the middle pane
@@ -12,6 +13,7 @@
 //   player.cpp   - plays audio by remote-controlling an mpv process
 //   download.cpp - downloads audio from a URL with yt-dlp
 //   playlist.cpp - reads and writes .m3u playlist files
+//   visualizer.cpp - records what's playing and turns it into spectrum bars
 //   main.cpp     - this file: all the state, key handling and drawing
 //
 // FTXUI works like the todo app: we keep plain C++ state in `App`, one
@@ -25,9 +27,12 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stop_token>
@@ -48,6 +53,7 @@
 #include "player.hpp"
 #include "progress.hpp"
 #include "playlist.hpp"
+#include "visualizer.hpp"
 
 using namespace ftxui;
 namespace fs = std::filesystem;
@@ -106,6 +112,26 @@ static fs::path state_file(const std::string& name) {
     const char* state = std::getenv("XDG_STATE_HOME");
     fs::path base = state ? fs::path(state) : fs::path(std::getenv("HOME")) / ".local" / "state";
     return base / "crate" / name;
+}
+
+// On/off settings kept in state files, written as 1 or 0.
+static bool read_flag(const std::string& name, bool fallback) {
+    bool value = fallback;
+    if (FILE* f = std::fopen(state_file(name).c_str(), "r")) {
+        int v = 0;
+        if (std::fscanf(f, "%d", &v) == 1) value = v != 0;
+        std::fclose(f);
+    }
+    return value;
+}
+
+static void write_flag(const std::string& name, bool value) {
+    std::error_code ec;
+    fs::create_directories(state_file(name).parent_path(), ec);
+    if (FILE* f = std::fopen(state_file(name).c_str(), "w")) {
+        std::fprintf(f, "%d\n", value ? 1 : 0);
+        std::fclose(f);
+    }
 }
 
 // "1.5×" style speed.
@@ -216,7 +242,9 @@ struct App {
     std::vector<fs::path> picking;  // songs being added with A
     int pick = -1;                  // highlighted playlist in the A picker
     std::string confirm_text;       // question asked in Confirm mode (y/n)
-    std::function<void()> confirm_action;
+    std::function<void()> confirm_action;  // y
+    std::function<void()> confirm_all;     // a, if the question offers it
+    bool confirm_enter = false;            // Enter means y
 
     TagForm form;
 
@@ -240,8 +268,23 @@ struct App {
     bool was_paused = false;
 
     // Playback speed for long tracks; music always plays at normal speed.
-    // Remembered per computer in ~/.local/state/crate/speed.
+    // Each artist remembers its own (lowercased name -> speed), so a new
+    // episode plays at the speed you used for that show last time; artists
+    // you haven't set use long_speed. Remembered per computer in
+    // ~/.local/state/crate/speed and speeds.tsv.
     double long_speed = 1.0;
+    std::map<std::string, double> artist_speed;
+
+    // --- spectrum panels and now playing ---
+    //   v  mini spectrum, in the bottom row beside now playing
+    //   b  big spectrum, full width above the bottom row, with a frequency axis
+    //   i  now playing
+    // On/off remembered in ~/.local/state/crate/{visualizer,big-spectrum,now-playing}.
+    Visualizer vis{[this] { screen.PostEvent(Event::Custom); }};
+    SpectrumBars mini_bars, big_bars;
+    bool show_vis = true, show_big = false, show_now = true;
+    int vis_rows = 0;  // mini spectrum rows shown last draw, 0 = hidden
+    int big_rows = 0;  // big spectrum bar rows shown last draw, 0 = hidden
 
     // =================================================================
     // Library: building the three panes
@@ -259,6 +302,20 @@ struct App {
             if (std::fscanf(f, "%lf", &s) == 1 && s >= 0.5 && s <= 3) long_speed = s;
             std::fclose(f);
         }
+        artist_speed.clear();
+        {
+            std::ifstream in(state_file("speeds.tsv"));
+            std::string line;
+            while (std::getline(in, line)) {
+                auto tab = line.rfind('\t');
+                if (tab == std::string::npos) continue;
+                double sp = std::atof(line.c_str() + tab + 1);
+                if (sp >= 0.5 && sp <= 3) artist_speed[line.substr(0, tab)] = sp;
+            }
+        }
+        show_vis = read_flag("visualizer", true);
+        show_big = read_flag("big-spectrum", false);
+        show_now = read_flag("now-playing", true);
 
         build_artists();
         build_groups();
@@ -489,20 +546,61 @@ struct App {
             from = p->seconds - 5;
         }
         player.play(tracks[track].path.string(), from);
-        player.set_speed(is_long(track) ? long_speed : 1.0);
+        player.set_speed(speed_of(track));
+    }
+
+    // The speed a track plays at: music always 1×, long tracks their artist's speed.
+    double speed_of(int track) const {
+        if (!is_long(track)) return 1.0;
+        auto it = artist_speed.find(lower(tracks[track].artist));
+        return it != artist_speed.end() ? it->second : long_speed;
+    }
+
+    // What < / > adjust: the playing long track's artist, else the default.
+    double current_speed() const {
+        return playing >= 0 && is_long(playing) ? speed_of(playing) : long_speed;
     }
 
     // < / > and :speed. Applies to long tracks only (podcasts, audiobooks).
+    // While one is playing, sets the speed for its artist; otherwise the
+    // default for artists that don't have one yet.
     void set_long_speed(double speed) {
-        long_speed = std::clamp(std::round(speed * 100) / 100, 0.5, 3.0);
-        if (playing >= 0 && is_long(playing)) player.set_speed(long_speed);
-        message = "Speed " + format_speed(long_speed) + " for podcasts and other long tracks";
+        speed = std::clamp(std::round(speed * 100) / 100, 0.5, 3.0);
         std::error_code ec;
         fs::create_directories(state_file("speed").parent_path(), ec);
+        if (playing >= 0 && is_long(playing)) {
+            const std::string& artist = tracks[playing].artist;
+            artist_speed[lower(artist)] = speed;
+            player.set_speed(speed);
+            message = "Speed " + format_speed(speed) + " for " + artist;
+            std::ofstream out(state_file("speeds.tsv"));
+            for (const auto& [name, sp] : artist_speed) out << name << '\t' << sp << '\n';
+            return;
+        }
+        long_speed = speed;
+        message = "Default speed " + format_speed(speed) + " for long tracks (artists you've set keep theirs)";
         if (FILE* f = std::fopen(state_file("speed").c_str(), "w")) {
             std::fprintf(f, "%g\n", long_speed);
             std::fclose(f);
         }
+    }
+
+    // v / :vis, b / :big and i / :now, each with an optional on|off.
+    // Returns the new setting and saves it.
+    bool set_panel(bool& flag, const std::string& file, const std::string& arg) {
+        flag = arg == "on" ? true : arg == "off" ? false : !flag;
+        write_flag(file, flag);
+        if (flag) vis.clear_error();  // turning a spectrum on retries capture
+        return flag;
+    }
+    void set_visualizer(const std::string& arg) {
+        message = set_panel(show_vis, "visualizer", arg) ? "Mini spectrum on (v hides it)" : "Mini spectrum off (v shows it)";
+    }
+    void set_big(const std::string& arg) {
+        message = set_panel(show_big, "big-spectrum", arg) ? "Big spectrum on (b hides it)" : "Big spectrum off (b shows it)";
+    }
+    void set_now_playing(const std::string& arg) {
+        message = set_panel(show_now, "now-playing", arg) ? "Now playing on (i hides it)" : "Now playing off (i shows it)";
     }
 
     // A track played to its end on its own.
@@ -913,33 +1011,63 @@ struct App {
     // dd in the artists or albums pane: delete everything it contains.
     void delete_group() {
         if (pane == Pane::Artists) {
-            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) {
-                message = "Pick an artist to delete (this one is a whole category)";
-                return;
-            }
-            std::string artist = artists[artist_cur.sel];
-            std::vector<int> doomed;
-            for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
-                if (lower(tracks[i].artist) == lower(artist)) doomed.push_back(i);
-            }
-            delete_songs(doomed, "everything by " + artist);
+            delete_artist_here();
         } else if (pane == Pane::Albums && !groups.empty()) {
             const Group& g = groups[group_cur.sel];
             if (g.kind == Group::List) return delete_playlist();
             if (g.kind == Group::AllAlbums) {
-                message = "Pick an album to delete, or press dd on the artist to delete all of it";
+                message = "Pick an album to delete, or press da to delete the whole artist";
                 return;
             }
-            std::vector<int> doomed;
-            for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
-                if (lower(tracks[i].artist) == lower(g.artist) && lower(tracks[i].album) == lower(g.album))
-                    doomed.push_back(i);
-            }
-            delete_songs(doomed, "the album " + g.label);
+            delete_album(g.artist, g.album);
         }
     }
 
-    // Ask, then move these songs to the trash and forget them everywhere.
+    // dr: the album of the selected song (or the selected album).
+    void delete_album_here() {
+        if (pane == Pane::Songs && !songs.empty()) {
+            const Track& t = tracks[songs[song_cur.sel]];
+            delete_album(t.artist, t.album);
+        } else if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
+            delete_album(groups[group_cur.sel].artist, groups[group_cur.sel].album);
+        } else {
+            message = "Select a song or an album to delete its album";
+        }
+    }
+
+    // da: the artist of the selected song, album or artist row.
+    void delete_artist_here() {
+        std::string artist;
+        if (pane == Pane::Songs && !songs.empty()) {
+            artist = tracks[songs[song_cur.sel]].artist;
+        } else if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
+            artist = groups[group_cur.sel].artist;
+        } else if (pane == Pane::Artists && artist_cur.sel != kAllArtists && artist_cur.sel != kPlaylists) {
+            artist = artists[artist_cur.sel];
+        } else if (pane == Pane::Albums && artist_cur.sel != kAllArtists && artist_cur.sel != kPlaylists) {
+            artist = artists[artist_cur.sel];  // on "All albums" of one artist
+        }
+        if (artist.empty()) { message = "Select an artist, album or song to delete its artist"; return; }
+        std::vector<int> doomed;
+        for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
+            if (lower(tracks[i].artist) == lower(artist)) doomed.push_back(i);
+        }
+        delete_songs(doomed, "everything by " + artist);
+    }
+
+    void delete_album(const std::string& artist, const std::string& album) {
+        std::vector<int> doomed;
+        for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
+            if (lower(tracks[i].artist) == lower(artist) && lower(tracks[i].album) == lower(album))
+                doomed.push_back(i);
+        }
+        delete_songs(doomed, "the album " + (album.empty() ? "(no album) by " + artist : album));
+    }
+
+    // Ask what to delete:
+    //   y (or Enter): just the downloaded files. The songs stay in library.tsv
+    //                 and in playlists as missing (⇣), so :sync can get them back.
+    //   a:            everything, files and library.tsv entries.
     // `what` describes them in the question ("the album X"); "" = list titles.
     void delete_songs(const std::vector<int>& doomed, const std::string& what) {
         if (doomed.empty()) return;
@@ -952,14 +1080,22 @@ struct App {
         std::string subject = !what.empty() ? what + " (" + plural(paths.size(), "song") + ")"
                             : paths.size() == 1 ? "\"" + tracks[doomed[0]].title + "\""
                                                 : plural(paths.size(), "song");
-        confirm_text = on_disk ? "Move " + subject + " to the trash? (y/n)"
-                               : "Remove " + subject + " from library.tsv? It isn't downloaded here. (y/n)";
         // Remember paths, not indices: indices change whenever the library reloads.
-        confirm_action = [this, paths] { really_delete(paths); };
+        if (on_disk == 0) {  // nothing downloaded here, so only forgetting is left
+            confirm_text = "Remove " + subject + " from library.tsv? It isn't downloaded here. (y/n)";
+            confirm_action = [this, paths] { really_delete(paths, true); };
+        } else {
+            confirm_text = "Delete " + subject + ": y = downloads only (keep in library) · a = everything · n = cancel [Y/a/n]";
+            confirm_action = [this, paths] { really_delete(paths, false); };
+            confirm_all = [this, paths] { really_delete(paths, true); };
+            confirm_enter = true;
+        }
         mode = Mode::Confirm;
     }
 
-    void really_delete(const std::vector<fs::path>& paths) {
+    // Trash the downloaded files. With `forget`, also drop the songs from
+    // library.tsv, playlists and the download queue.
+    void really_delete(const std::vector<fs::path>& paths, bool forget) {
         std::vector<std::string> gone;  // as strings, for quick comparisons
         int trashed = 0;
         std::string error;
@@ -978,10 +1114,19 @@ struct App {
             }
             gone.push_back(p.string());
         }
+        std::string undo = trashed ? " (" + std::to_string(trashed) + " in the trash, restore from your file manager)" : "";
+
+        if (!forget) {
+            // library.tsv already lists them, so the reload turns them into missing songs.
+            load();
+            message = "Removed " + plural(trashed, "download") + undo + " · :sync gets them back";
+            if (!error.empty()) message += " · some failed: " + error;
+            return;
+        }
+
         auto is_gone = [&](const fs::path& p) {
             return std::find(gone.begin(), gone.end(), p.string()) != gone.end();
         };
-
         // Out of every playlist...
         for (Playlist& pl : playlists) {
             auto before = pl.songs.size();
@@ -995,8 +1140,7 @@ struct App {
         save_manifest();
         load();
 
-        message = "Deleted " + plural(gone.size(), "song") +
-                  (trashed ? " (" + std::to_string(trashed) + " in the trash, restore from your file manager)" : "");
+        message = "Deleted " + plural(gone.size(), "song") + undo;
         if (!error.empty()) message += " · some failed: " + error;
     }
 
@@ -1271,6 +1415,12 @@ struct App {
             else message = "Usage: :speed 1.5  (0.5 to 3)";
         }
         else if (verb == "help") show_help = true;
+        else if (verb == "vis" || verb == "big" || verb == "now") {
+            if (arg != "" && arg != "on" && arg != "off") message = "Usage: :" + verb + " [on|off]";
+            else if (verb == "vis") set_visualizer(arg);
+            else if (verb == "big") set_big(arg);
+            else set_now_playing(arg);
+        }
         else if (verb == "new") new_playlist(arg);
         else if (verb == "rename") rename_playlist(arg);
         else if (verb == "delete") delete_playlist();
@@ -1423,7 +1573,14 @@ struct App {
         if (mode == Mode::Pick) return on_pick_key(e);
         if (mode == Mode::Confirm) {
             mode = Mode::Normal;
-            if (e == Event::Character('y')) confirm_action();
+            auto yes = std::move(confirm_action);
+            auto all = std::move(confirm_all);
+            bool enter = confirm_enter;
+            confirm_action = nullptr;
+            confirm_all = nullptr;
+            confirm_enter = false;
+            if (e == Event::Character('y') || (enter && e == Event::Return)) yes();
+            else if (all && e == Event::Character('a')) all();
             else message = "Cancelled";
             return true;
         }
@@ -1457,6 +1614,8 @@ struct App {
                 if (pane == Pane::Songs) delete_rows(std::max(1, first_count));
                 else delete_group();
             }
+            if (first == 'd' && c == "r") delete_album_here();
+            if (first == 'd' && c == "a") delete_artist_here();
             return true;
         }
         auto start_pending = [&](char key) {
@@ -1500,8 +1659,11 @@ struct App {
         else if (c == "+" || c == "=") player.change_volume(5 * n);
         else if (c == "-") player.change_volume(-5 * n);
         else if (c == "s") toggle_shuffle();
-        else if (c == ">") set_long_speed(long_speed + 0.25 * n);
-        else if (c == "<") set_long_speed(long_speed - 0.25 * n);
+        else if (c == "v") set_visualizer("");
+        else if (c == "i") set_now_playing("");
+        else if (c == "b") set_big("");
+        else if (c == ">") set_long_speed(current_speed() + 0.1 * n);
+        else if (c == "<") set_long_speed(current_speed() - 0.1 * n);
 
         // --- playlists (vim-style: yank, delete, put) ---
         else if (c == "V") songs_only([&] { visual = (visual >= 0 || songs.empty()) ? -1 : song_cur.sel; });
@@ -1634,28 +1796,92 @@ struct App {
         }, [&](int i) { return i >= lo && i <= hi; }) | flex;
     }
 
-    Element draw_now_playing() const {
-        Element top, bottom;
+    // Compact now-playing box, `height` rows inside: title and artist at the
+    // top, a short progress bar at the bottom. Volume and the like go in
+    // the title of the box.
+    Element draw_now_playing(int height) const {
+        Elements lines;
+        Element progress = text("");
         if (playing < 0) {
-            top = text("  Nothing playing. Enter plays the selected song.") | dim;
-            bottom = text("");
+            lines = {text(" Nothing playing") | dim, text(" Enter plays the selected song") | dim};
         } else {
             const Track& t = tracks[playing];
             double pos = player.position(), len = player.duration();
-            float progress = len > 0 ? static_cast<float>(pos / len) : 0.f;
-            top = hbox({text(player.paused() ? " ⏸ " : " ▶ ") | color(Color::Green),
-                        text(t.title) | bold, text("  " + t.artist) | dim,
-                        text(t.album.empty() ? "" : "  ·  " + t.album) | dim});
-            bottom = hbox({text(" " + (pos < 1 ? std::string("0:00") : format_time((int)pos)) + " "),
-                           gauge(progress) | color(Color::Green) | flex,
-                           text(" " + format_time((int)len) + " ")});
+            float frac = len > 0 ? static_cast<float>(pos / len) : 0.f;
+            lines = {hbox({text(player.paused() ? " ⏸ " : " ▶ ") | color(Color::Green), text(t.title) | bold}),
+                     text("   " + t.artist + (t.album.empty() ? "" : " · " + t.album)) | dim};
+            progress = hbox({text(" " + (pos < 1 ? std::string("0:00") : format_time((int)pos)) + " "),
+                             gauge(frac) | color(Color::Green) | size(WIDTH, LESS_THAN, 40) | flex,
+                             text(" " + format_time((int)len) + " "), filler()});
         }
-        bool sped = playing >= 0 && is_long(playing) && long_speed != 1.0;
-        std::string flags = (sped ? " " + format_speed(long_speed) + " " : "") +
-                            " vol " + std::to_string(player.volume()) + "%" +
-                            (shuffle ? "  shuffle" : "") + " ";
-        return window(text(" Now playing ") | dim,
-                      vbox({hbox({top | flex, text(flags) | dim}), bottom}));
+        while (static_cast<int>(lines.size()) < height - 1) lines.push_back(text(""));
+        lines.push_back(progress);
+
+        bool sped = playing >= 0 && speed_of(playing) != 1.0;
+        std::string flags = " vol " + std::to_string(player.volume()) + "%" +
+                            (sped ? " · " + format_speed(speed_of(playing)) : "") + (shuffle ? " · shuffle" : "") + " ";
+        return window(hbox({text(" Now playing ") | dim, filler(), text(flags) | dim}), vbox(std::move(lines)));
+    }
+
+    // A spectrum panel `width` columns wide (border included) with `height`
+    // rows of bars. Each cell is one of 8 block heights, so a bar moves in
+    // steps of 1/8 of a row. `axis` adds frequency ticks along the bottom.
+    Element draw_spectrum(SpectrumBars& sb, int width, int height, bool axis, const std::string& key) {
+        int inner = std::max(1, width - 2);
+        int bar_w = inner >= 100 ? 2 : 1;  // wide: 2-column bars
+        int n = std::max(1, (inner + 1) / (bar_w + 1));
+        sb.step(vis.levels(n));
+        Element title = text(" Spectrum ") | dim;
+
+        if (std::string err = vis.error(); !err.empty()) {
+            Elements lines{paragraph(" " + err) | dim, text(" " + key + " hides this") | dim};
+            return window(title, vbox(std::move(lines)) | size(HEIGHT, EQUAL, height + (axis ? 2 : 0)));
+        }
+
+        static const char* blocks[] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+        int pad = (inner - (n * (bar_w + 1) - 1)) / 2;  // centre the bars
+        Elements lines;
+        for (int r = 0; r < height; ++r) {
+            int from_bottom = height - 1 - r;
+            std::string line(pad, ' ');
+            for (int i = 0; i < n; ++i) {
+                int fill = std::clamp(static_cast<int>(sb.bars[i] * height * 8) - from_bottom * 8, 0, 8);
+                float peak = sb.peaks[i] * height - from_bottom;  // where the cap sits in this cell, 0..1
+                const char* cell = blocks[fill];
+                if (fill == 0 && peak > 0 && peak <= 1 && sb.peaks[i] > 0.02f) cell = peak < 0.5f ? "▁" : "▔";
+                for (int k = 0; k < bar_w; ++k) line += cell;
+                if (i + 1 < n) line += ' ';
+            }
+            // One colour: the app's accent, as on the active pane title and
+            // the playing song. A named colour, so it follows the terminal theme.
+            lines.push_back(text(line) | color(Color::Green));
+        }
+
+        if (axis) {
+            // A ruler with a ┬ under each frequency, and its label below.
+            // Labels that would overlap the previous one are left out.
+            static const std::pair<float, const char*> ticks[] = {
+                {50, "50"}, {100, "100"}, {200, "200"}, {500, "500"}, {1000, "1k"},
+                {2000, "2k"}, {5000, "5k"}, {10000, "10k"}, {16000, "16k"}};
+            std::vector<std::string> ruler(inner, "─");
+            std::string labels(inner, ' ');
+            int free_from = 0;  // first column a new label may use
+            for (auto [hz, label] : ticks) {
+                float x = std::log(hz / kSpectrumLowHz) / std::log(kSpectrumHighHz / kSpectrumLowHz);  // 0..1
+                int col = std::clamp(pad + static_cast<int>(x * n * (bar_w + 1)), 0, inner - 1);
+                int len = static_cast<int>(std::strlen(label));
+                int start = std::clamp(col - len / 2, 0, inner - len);
+                if (start < free_from) continue;
+                ruler[col] = "┬";
+                labels.replace(start, len, label);
+                free_from = start + len + 1;
+            }
+            std::string ruler_line;
+            for (const auto& cell : ruler) ruler_line += cell;
+            lines.push_back(text(ruler_line) | dim);
+            lines.push_back(text(labels) | dim);
+        }
+        return window(title, vbox(std::move(lines)));
     }
 
     Element draw_status() const {
@@ -1781,10 +2007,14 @@ struct App {
             line("] / [", "next / previous song"),
             line("← / →  { / }", "seek 5s / 30s"),
             line("+ / -   s", "volume   shuffle"),
-            line("> / <  :speed 1.5", "faster / slower (podcasts only)"),
+            line("v / b / i", "mini / big spectrum, now playing"),
+            line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Library"),
             line("a / e", "add song from URL / edit tags"),
-            line("dd", "delete song / album / artist (asks; goes to trash)"),
+            line("dd", "delete song (or the album / artist pane's selection)"),
+            line("dr da", "delete the selected song's album / artist"),
+            line("", "asks: y/Enter = downloads only, a = also forget it, n = cancel"),
+            line(":vis :big :now", "same, add on|off to choose"),
             line(":rescan  :q", "rescan the folder / quit"),
         });
         Element right = vbox({
@@ -1808,11 +2038,31 @@ struct App {
     }
 
     Element draw() {
-        // Rows left for list items: screen minus now-playing (4), status (1),
-        // the panes' borders (2) and their header row (1).
         auto term = Terminal::Size();
-        rows = std::max(1, term.dimy - 8);
         cols = term.dimx;
+        int list_rows_base = term.dimy - 4;  // minus status, pane borders and header
+
+        // Bottom row: [ now playing ][ mini spectrum ......... ], 3 rows
+        // inside. The mini spectrum hides where it would be too cramped
+        // (a phone). Either panel can be turned off.
+        int now_w = show_now ? std::clamp(cols / 3, 34, 56) : 0;
+        bool fits = cols - now_w >= 30 && term.dimy >= 20;
+        vis_rows = show_vis && fits ? 3 : 0;
+        int bottom = vis_rows ? vis_rows : show_now ? 3 : 0;  // rows inside the bottom boxes
+
+        // The big spectrum goes full width above that: about a quarter of
+        // the height, plus its border (2) and frequency axis (2). Skipped
+        // when it would leave the lists fewer than 6 rows.
+        big_rows = show_big ? std::clamp(term.dimy / 4, 4, 14) : 0;
+
+        // Rows left for list items: screen minus status (1), the panes'
+        // borders (2) and header row (1), and the spectrum and bottom rows.
+        rows = list_rows_base - (bottom ? bottom + 2 : 0);
+        if (big_rows && rows - (big_rows + 4) < 6) big_rows = 0;
+        rows = std::max(1, rows - (big_rows ? big_rows + 4 : 0));
+
+        bool playing_now = playing >= 0 && !player.paused() && !player.loading();
+        vis.set_live((vis_rows > 0 || big_rows > 0) && playing_now);
 
         // Fit as many panes as the width allows, then slide the window of
         // visible panes just far enough to keep the active one on screen.
@@ -1827,9 +2077,20 @@ struct App {
         if (visible(Pane::Songs)) visible_panes.push_back(draw_songs() | reflect(pane_box[2]));
         Element panes = hbox(std::move(visible_panes));
 
+        Elements bottom_row;
+        if (show_now) {
+            Element now = draw_now_playing(bottom) | reflect(now_box);
+            bottom_row.push_back(vis_rows ? now | size(WIDTH, EQUAL, now_w) : now | flex);
+        } else {
+            now_box = Box{};  // nothing there to tap
+        }
+        if (vis_rows) bottom_row.push_back(draw_spectrum(mini_bars, cols - (show_now ? now_w : 0), vis_rows, false, "v") | flex);
+        vis.set_moving(playing_now || mini_bars.moving() || big_bars.moving());
+
         Element main = vbox({
             panes | flex,
-            draw_now_playing() | reflect(now_box),
+            big_rows ? draw_spectrum(big_bars, cols, big_rows, true, "b") : text("") | size(HEIGHT, EQUAL, 0),
+            hbox(std::move(bottom_row)),
             draw_status(),
         });
         if (mode == Mode::Tag) return dbox({main, draw_form()});

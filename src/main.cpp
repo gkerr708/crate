@@ -1016,38 +1016,30 @@ struct App {
             const Group& g = groups[group_cur.sel];
             if (g.kind == Group::List) return delete_playlist();
             if (g.kind == Group::AllAlbums) {
-                message = "Pick an album to delete, or press da to delete the whole artist";
+                message = "Pick an album to delete, or go to the artists pane to delete the whole artist";
                 return;
             }
             delete_album(g.artist, g.album);
         }
     }
 
-    // dr: the album of the selected song (or the selected album).
+    // dr: the selected album. Only in the albums pane, so a stray dr while
+    // browsing songs can't take out a whole album.
     void delete_album_here() {
-        if (pane == Pane::Songs && !songs.empty()) {
-            const Track& t = tracks[songs[song_cur.sel]];
-            delete_album(t.artist, t.album);
-        } else if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
+        if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
             delete_album(groups[group_cur.sel].artist, groups[group_cur.sel].album);
         } else {
-            message = "Select a song or an album to delete its album";
+            message = "dr deletes an album: select one in the albums pane";
         }
     }
 
-    // da: the artist of the selected song, album or artist row.
+    // da: the selected artist. Only in the artists pane, for the same reason.
     void delete_artist_here() {
         std::string artist;
-        if (pane == Pane::Songs && !songs.empty()) {
-            artist = tracks[songs[song_cur.sel]].artist;
-        } else if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
-            artist = groups[group_cur.sel].artist;
-        } else if (pane == Pane::Artists && artist_cur.sel != kAllArtists && artist_cur.sel != kPlaylists) {
+        if (pane == Pane::Artists && artist_cur.sel != kAllArtists && artist_cur.sel != kPlaylists) {
             artist = artists[artist_cur.sel];
-        } else if (pane == Pane::Albums && artist_cur.sel != kAllArtists && artist_cur.sel != kPlaylists) {
-            artist = artists[artist_cur.sel];  // on "All albums" of one artist
         }
-        if (artist.empty()) { message = "Select an artist, album or song to delete its artist"; return; }
+        if (artist.empty()) { message = "da deletes an artist: select one in the artists pane"; return; }
         std::vector<int> doomed;
         for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
             if (lower(tracks[i].artist) == lower(artist)) doomed.push_back(i);
@@ -2012,7 +2004,7 @@ struct App {
             heading("Library"),
             line("a / e", "add song from URL / edit tags"),
             line("dd", "delete song (or the album / artist pane's selection)"),
-            line("dr da", "delete the selected song's album / artist"),
+            line("dr / da", "delete the album (albums pane) / artist (artists pane)"),
             line("", "asks: y/Enter = downloads only, a = also forget it, n = cancel"),
             line(":vis :big :now", "same, add on|off to choose"),
             line(":rescan  :q", "rescan the folder / quit"),

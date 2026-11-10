@@ -205,7 +205,7 @@ struct App {
     std::string filter;                // active search text
 
     // --- UI ---
-    Pane pane = Pane::Songs;
+    Pane pane = Pane::Artists;  // start in the artists pane
     Mode mode = Mode::Normal;
     std::string input;    // what's being typed after /, :, the URL prompt or the playlist picker
     std::string message;  // one-off feedback, cleared on the next key

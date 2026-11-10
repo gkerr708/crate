@@ -1784,7 +1784,11 @@ struct App {
             }
             Element row = columns(text(mark), text(t.title), text(t.artist), text(t.album), text(time));
             if (t.missing || (done && !is_playing)) return row | dim;
-            return is_playing ? row | color(Color::Green) : row;
+            if (!is_playing) return row;
+            // Green text clashes with the unfocused highlight's background,
+            // so on that row the playing song is bold instead (▶ still marks it).
+            bool on_dim_highlight = i == song_cur.sel && pane != Pane::Songs;
+            return on_dim_highlight ? row | bold : row | color(Color::Green);
         }, [&](int i) { return i >= lo && i <= hi; }) | flex;
     }
 

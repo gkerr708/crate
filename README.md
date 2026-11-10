@@ -9,12 +9,13 @@ A terminal music player.
 sudo pacman -S --needed base-devel cmake git pkgconf taglib libpulse
 
 # needed at runtime
-sudo pacman -S --needed mpv yt-dlp ffmpeg wl-clipboard
+sudo pacman -S --needed mpv yt-dlp ffmpeg wl-clipboard mpv-mpris
 ```
 
 - `mpv` plays the audio.
 - `yt-dlp` and `ffmpeg` handle downloads.
 - `wl-clipboard` provides `wl-paste`, used for pasting.
+- `mpv-mpris` lets the keyboard's play/pause key (and other desktop media controls) control crate. It's optional, and does nothing on Android/Termux.
 - `libpulse` lets the visualizer record what's playing (works with PipeWire too). It's optional: without it crate still builds, minus the visualizer.
 
 FTXUI (the TUI library) isn't installed with pacman. CMake downloads it the first time you configure, which needs an internet connection.

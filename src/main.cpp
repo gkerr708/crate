@@ -73,7 +73,7 @@ struct Cursor {
 };
 
 enum class Pane { Artists, Albums, Songs };
-enum class Mode { Normal, Search, Command, Url, Tag, Pick, Confirm };
+enum class Mode { Normal, Search, Command, Url, Tag, Pick, Confirm, Rename };
 
 // The first two rows of the artists pane are special.
 constexpr int kAllArtists = 0;
@@ -224,6 +224,7 @@ struct App {
     std::vector<int> slots;            // in a playlist: songs[i] is entry slots[i] of it
     Cursor artist_cur, group_cur, song_cur;
     std::string filter;                // active search text (songs pane)
+    std::uintmax_t library_bytes = 0;  // everything in the music folder, shown bottom right
     std::string jump;                  // last / search in the artists or albums pane
     int jump_origin = 0;               // where the cursor was when that search began
 
@@ -315,6 +316,7 @@ struct App {
     void load() {
         std::string playing_path = playing >= 0 ? tracks[playing].path.string() : "";
         tracks = scan_library(dir);
+        library_bytes = folder_size(dir);
         merge_manifest();
         track_index.clear();
         for (int i = 0; i < static_cast<int>(tracks.size()); ++i) track_index[tracks[i].path.string()] = i;
@@ -351,6 +353,30 @@ struct App {
         queue_pos = index_of(queue, playing);
 
         if (tracks.empty()) message = "No audio files found in " + dir.string();
+    }
+
+    // Total size of every file under `folder`, skipping anything unreadable.
+    static std::uintmax_t folder_size(const fs::path& folder) {
+        std::uintmax_t total = 0;
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(folder, fs::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code size_ec;
+            if (it->is_regular_file(size_ec)) {
+                auto n = it->file_size(size_ec);
+                if (!size_ec) total += n;
+            }
+        }
+        return total;
+    }
+
+    // 4.2 GB, or 350 MB under a gigabyte.
+    static std::string human_size(std::uintmax_t bytes) {
+        char buf[32];
+        double gb = bytes / 1e9;
+        if (gb >= 1) std::snprintf(buf, sizeof buf, "%.1f GB", gb);
+        else std::snprintf(buf, sizeof buf, "%.0f MB", bytes / 1e6);
+        return buf;
     }
 
     // Path relative to the library folder, as stored in library.tsv.
@@ -1005,6 +1031,49 @@ struct App {
         message = "Downloaded " + title + (left ? " (" + std::to_string(left) + " to go)" : "");
     }
 
+    // :sync [artist|album]: download the missing songs of the whole
+    // library, the selected artist, or the selected album / playlist.
+    void sync(const std::string& scope) {
+        std::vector<int> picked;  // indices into `tracks`
+        std::string where;
+        if (scope.empty() || scope == "all") {
+            for (int i = 0; i < static_cast<int>(tracks.size()); ++i) picked.push_back(i);
+            where = "library.tsv";
+        } else if (scope == "artist") {
+            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) {
+                message = "Select an artist in the artists pane first";
+                return;
+            }
+            std::string artist = lower(artists[artist_cur.sel]);
+            for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
+                if (lower(tracks[i].artist) == artist) picked.push_back(i);
+            where = artists[artist_cur.sel];
+        } else if (scope == "album") {
+            if (groups.empty()) { message = "Select an album first"; return; }
+            const Group& g = groups[group_cur.sel];
+            if (g.kind == Group::List) {
+                for (const fs::path& p : playlists[g.playlist].songs)
+                    if (auto it = track_index.find(p.string()); it != track_index.end()) picked.push_back(it->second);
+            } else {
+                std::string artist = artist_cur.sel == kAllArtists ? "" : lower(artists[artist_cur.sel]);
+                for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
+                    const Track& t = tracks[i];
+                    if (g.kind == Group::Album ? lower(t.artist) == lower(g.artist) && lower(t.album) == lower(g.album)
+                                               : artist.empty() || lower(t.artist) == artist)
+                        picked.push_back(i);
+                }
+            }
+            where = g.label;
+        } else {
+            message = "Usage: :sync [artist|album]  (no argument syncs everything)";
+            return;
+        }
+        std::vector<std::string> missing;
+        for (int i : picked) if (tracks[i].missing) missing.push_back(rel(tracks[i].path));
+        if (missing.empty()) message = "Everything in " + where + " is already downloaded";
+        else restore(missing);
+    }
+
     void set_source(const std::string& url) {
         if (pane != Pane::Songs || songs.empty()) { message = "Select a song first"; return; }
         if (url.empty()) { message = "Usage: :source <url>  (where this song can be downloaded)"; return; }
@@ -1088,10 +1157,11 @@ struct App {
     void delete_songs(const std::vector<int>& doomed, const std::string& what) {
         if (doomed.empty()) return;
         std::vector<fs::path> paths;
-        int on_disk = 0;
+        int on_disk = 0, no_link = 0;  // no_link: downloaded here, but with no URL to get it back
         for (int i : doomed) {
             paths.push_back(tracks[i].path);
             if (!tracks[i].missing) ++on_disk;
+            if (!tracks[i].missing && tracks[i].source.empty()) ++no_link;
         }
         std::string subject = !what.empty() ? what + " (" + plural(paths.size(), "song") + ")"
                             : paths.size() == 1 ? "\"" + tracks[doomed[0]].title + "\""
@@ -1103,6 +1173,19 @@ struct App {
         } else {
             confirm_text = "Delete " + subject + ": y = downloads only (keep in library) · a = everything · n = cancel [Y/a/n]";
             confirm_action = [this, paths] { really_delete(paths, false); };
+            if (no_link) {
+                // Keeping the details is only useful if it can be downloaded
+                // again, so say when it can't before trashing it.
+                std::string these = no_link == 1 && paths.size() == 1 ? "This song has"
+                                  : no_link == 1                      ? "1 of these songs has"
+                                                                      : std::to_string(no_link) + " of these songs have";
+                confirm_action = [this, paths, these] {
+                    confirm_text = these + " no link: its title, artist and album stay in your library, but"
+                                   " :sync can't download it again (:source <url> adds a link). Delete the audio? (y/n)";
+                    confirm_action = [this, paths] { really_delete(paths, false); };
+                    mode = Mode::Confirm;
+                };
+            }
             confirm_all = [this, paths] { really_delete(paths, true); };
             confirm_enter = true;
         }
@@ -1287,7 +1370,8 @@ struct App {
 
     // `e`: edit the selected song's tags.
     void begin_edit() {
-        if (pane != Pane::Songs || songs.empty()) return;
+        if (pane != Pane::Songs) return begin_rename();
+        if (songs.empty()) return;
         const Track& t = tracks[songs[song_cur.sel]];
         form = {};
         form.file = t.path;
@@ -1295,6 +1379,69 @@ struct App {
         form.fields[TagForm::Artist] = t.artist == "Unknown Artist" ? "" : t.artist;
         form.fields[TagForm::Album] = t.album;
         mode = Mode::Tag;
+    }
+
+    // `e` in the artists / albums pane: type a new name for the selected
+    // artist, album or playlist on the status line.
+    void begin_rename() {
+        if (pane == Pane::Artists) {
+            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) {
+                message = "Select an artist to rename";
+                return;
+            }
+            input = artists[artist_cur.sel];
+        } else {
+            if (groups.empty()) return;
+            const Group& g = groups[group_cur.sel];
+            if (g.kind == Group::AllAlbums) { message = "Select an album to rename"; return; }
+            input = g.kind == Group::List ? playlists[g.playlist].name : g.album;
+        }
+        mode = Mode::Rename;
+    }
+
+    // What the rename prompt is renaming, for the status line.
+    std::string rename_subject() const {
+        if (pane == Pane::Artists) return "artist";
+        return !groups.empty() && groups[group_cur.sel].kind == Group::List ? "playlist" : "album";
+    }
+
+    // Enter in the rename prompt: retag every song of the artist / album.
+    // Files stay where they are (as with editing a song), so playlists
+    // that point at them keep working.
+    void apply_rename(std::string name) {
+        name = trim(name);
+        bool renaming_artist = pane == Pane::Artists;
+        Group g = renaming_artist || groups.empty() ? Group{} : groups[group_cur.sel];
+        if (g.kind == Group::List) return rename_playlist(name);
+        if (renaming_artist && name.empty()) { message = "The artist name can't be empty"; return; }
+
+        std::string old_artist = renaming_artist ? artists[artist_cur.sel] : g.artist;
+        if (renaming_artist) name = match_known(TagForm::Artist, name);  // join "tool" onto "Tool"
+        auto selected = [&](const Track& t) {
+            if (lower(t.artist) != lower(old_artist)) return false;
+            return renaming_artist || lower(t.album) == lower(g.album);
+        };
+
+        int changed = 0, failed = 0;
+        fs::path first;
+        for (Track& t : tracks) {
+            if (!selected(t)) continue;
+            if (renaming_artist) t.artist = name;
+            else t.album = name;
+            std::string artist = t.artist == "Unknown Artist" ? "" : t.artist;
+            // A song not downloaded here only lives in library.tsv, saved below.
+            if (!t.missing && !write_tags(t.path, t.title, artist, t.album, t.number)) { ++failed; continue; }
+            if (first.empty()) first = t.path;
+            ++changed;
+        }
+        save_manifest();
+        load();
+        if (!first.empty()) {
+            select_path(first);
+            set_pane(renaming_artist ? static_cast<int>(Pane::Artists) : static_cast<int>(Pane::Albums));
+        }
+        message = "Renamed " + plural(changed, "song") + " to " + (name.empty() ? "no album" : name);
+        if (failed) message += " · " + std::to_string(failed) + " couldn't be retagged";
     }
 
     // Every distinct artist in the library, or every album by the form's artist.
@@ -1556,12 +1703,7 @@ struct App {
         else if (verb == "new") new_playlist(arg);
         else if (verb == "rename") rename_playlist(arg);
         else if (verb == "delete") delete_playlist();
-        else if (verb == "sync") {
-            std::vector<std::string> missing;
-            for (const Track& t : tracks) if (t.missing) missing.push_back(rel(t.path));
-            if (missing.empty()) message = "Everything in library.tsv is already downloaded";
-            else restore(missing);
-        }
+        else if (verb == "sync") sync(arg);
         else if (verb == "source") set_source(arg);
         else if (verb == "forget") forget_song();
         else if (!verb.empty() && std::all_of(verb.begin(), verb.end(), ::isdigit)) {
@@ -1613,6 +1755,7 @@ struct App {
                 if (!input.empty() && find_row(input, jump_origin, 1) < 0) message = "Not found: " + input;
             }
             if (was == Mode::Command) run_command(input);
+            if (was == Mode::Rename) apply_rename(input);
             if (was == Mode::Url && !trim(input).empty()) start_add(trim(input));
         } else if (e == Event::CtrlU) {
             input.clear();
@@ -2070,6 +2213,10 @@ struct App {
         } else if (mode == Mode::Command) {
             mode_tag = tag("COMMAND", Color::Magenta);
             rest = text(" :" + input + "▏");
+        } else if (mode == Mode::Rename) {
+            mode_tag = tag("RENAME", Color::Blue);
+            rest = hbox({text(" New " + rename_subject() + " name: "), text(input + "▏"),
+                         text("   Enter save · Esc cancel") | dim});
         } else if (mode == Mode::Url) {
             mode_tag = tag("ADD", Color::Cyan);
             rest = hbox({text(" URL: "), text(input + "▏"), text("   Enter download · Esc cancel") | dim});
@@ -2085,7 +2232,7 @@ struct App {
                                (pending ? std::string(1, pending) : "");
             rest = text(" " + (message.empty() ? keys : message));
         }
-        std::string right = plural(songs.size(), "song") + "  ? help ";
+        std::string right = plural(songs.size(), "song") + "  " + human_size(library_bytes) + "  ? help ";
         std::string queued = restore_queue.empty() ? "" : " +" + std::to_string(restore_queue.size());
         std::string of;  // "3/12 " in a playlist
         if (downloader.item() > 0) {
@@ -2217,7 +2364,7 @@ struct App {
             line("v / b / i", "mini / big spectrum, now playing"),
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Library"),
-            line("a / e", "add song from URL / edit tags"),
+            line("a / e", "add song from URL / edit tags (or rename the artist / album)"),
             line("", "a playlist URL adds the whole playlist as an album"),
             line("dd", "delete song (or the album / artist pane's selection)"),
             line("dr / da", "delete the album (albums pane) / artist (artists pane)"),
@@ -2235,6 +2382,7 @@ struct App {
             heading("Other computers  (⇣ = not downloaded here)"),
             line("Enter on ⇣", "download that song"),
             line(":sync", "download every missing song"),
+            line(":sync artist / album", "just the selected artist's / album's"),
             line(":source URL", "set where the song can be downloaded"),
             line(":forget", "remove a missing song from the list"),
         });

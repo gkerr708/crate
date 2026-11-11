@@ -54,6 +54,7 @@
 #include "player.hpp"
 #include "progress.hpp"
 #include "playlist.hpp"
+#include "shrink.hpp"
 #include "visualizer.hpp"
 
 using namespace ftxui;
@@ -83,6 +84,10 @@ enum class AddKind { Song, Album, Podcast };
 // Podcasts are speech, which sounds fine at a fraction of music's bitrate.
 constexpr const char* kPodcastFormat = "opus";
 constexpr const char* kPodcastQuality = "48K";
+// :shrink re-encodes to Opus at this bitrate; files already below
+// kShrinkSkipBps (bits per second) aren't worth it.
+constexpr const char* kShrinkBitrate = "48k";
+constexpr std::uintmax_t kShrinkSkipBps = 80000;
 
 // The first two rows of the artists pane are special.
 constexpr int kAllArtists = 0;
@@ -317,6 +322,13 @@ struct App {
     //   i  now playing
     // On/off remembered in ~/.local/state/crate/{visualizer,big-spectrum,now-playing}.
     Visualizer vis{[this] { screen.PostEvent(Event::Custom); }};
+
+    // --- :shrink ---
+    Shrinker shrinker{[this] { screen.PostEvent(Event::Custom); }};
+    bool shrinking = false;          // a batch was started and hasn't been summed up yet
+    int shrink_done = 0, shrink_failed = 0;
+    std::uintmax_t shrink_saved = 0;  // bytes
+    std::string shrink_error;
     SpectrumBars mini_bars, big_bars;
     bool show_vis = true, show_big = false, show_now = true;
     int vis_rows = 0;  // mini spectrum rows shown last draw, 0 = hidden
@@ -1094,33 +1106,146 @@ struct App {
 
     // :podcast [on|off]: mark (or unmark) the selected song, album or artist
     // as a podcast. Without on/off it flips, going by the first song.
-    void mark_podcast(const std::string& arg) {
-        if (arg != "" && arg != "on" && arg != "off") { message = "Usage: :podcast [on|off]"; return; }
+    // What a command like :podcast or :shrink acts on: the selected song(s)
+    // in the songs pane, else the selected album or artist. Indices into
+    // `tracks`; `what` names it for messages. Empty (with a message) if
+    // nothing suitable is selected.
+    std::vector<int> selected_tracks(std::string& what) {
         std::vector<int> picked;
-        std::string what;
         if (pane == Pane::Songs) {
-            if (songs.empty()) return;
+            if (songs.empty()) return {};
             auto [first, last] = row_range(1);
             picked.assign(songs.begin() + first, songs.begin() + last + 1);
             what = picked.size() == 1 ? tracks[picked[0]].title : plural(picked.size(), "song");
         } else if (pane == Pane::Artists) {
-            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) { message = "Select an artist first"; return; }
+            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) { message = "Select an artist first"; return {}; }
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
                 if (lower(tracks[i].artist) == lower(artists[artist_cur.sel])) picked.push_back(i);
             what = artists[artist_cur.sel];
         } else {
-            if (groups.empty() || groups[group_cur.sel].kind != Group::Album) { message = "Select an album first"; return; }
+            if (groups.empty() || groups[group_cur.sel].kind != Group::Album) { message = "Select an album first"; return {}; }
             const Group& g = groups[group_cur.sel];
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
                 if (lower(tracks[i].artist) == lower(g.artist) && lower(tracks[i].album) == lower(g.album)) picked.push_back(i);
             what = g.label;
         }
+        return picked;
+    }
+
+    void mark_podcast(const std::string& arg) {
+        if (arg != "" && arg != "on" && arg != "off") { message = "Usage: :podcast [on|off]"; return; }
+        std::string what;
+        std::vector<int> picked = selected_tracks(what);
         if (picked.empty()) return;
         bool on = arg == "on" ? true : arg == "off" ? false : !tracks[picked[0]].podcast;
         for (int i : picked) tracks[i].podcast = on;
         visual = -1;
         save_manifest();
         message = what + (on ? " is now a podcast (keeps your place, < / > speed)" : " is no longer a podcast");
+    }
+
+    // :shrink: re-encode the selected song(s), album or artist to low-bitrate
+    // Opus, in the background. Works without a link, unlike :sync.
+    void shrink() {
+        if (shrinker.busy()) { message = "Already shrinking (see the bottom right)"; return; }
+        std::string what;
+        std::vector<int> picked = selected_tracks(what);
+        if (picked.empty()) return;
+        std::vector<ShrinkJob> jobs;
+        int small = 0, absent = 0, now_playing = 0;
+        for (int i : picked) {
+            const Track& t = tracks[i];
+            if (t.missing) { ++absent; continue; }
+            if (i == playing) { ++now_playing; continue; }  // mpv has it open
+            std::error_code ec;
+            std::uintmax_t bytes = fs::file_size(t.path, ec);
+            if (ec) continue;
+            if (t.seconds > 0 && bytes * 8 / t.seconds < kShrinkSkipBps) { ++small; continue; }
+            // Encode into the cache, so a rescan never finds half a file in the library.
+            fs::path out = incoming_dir() / ("shrinking-" + std::to_string(jobs.size()) + ".opus");
+            jobs.push_back({t.path, out, t.seconds});
+        }
+        std::string notes;
+        if (small) notes += " · " + std::to_string(small) + " already small";
+        if (absent) notes += " · " + std::to_string(absent) + " not downloaded";
+        if (now_playing) notes += " · skipped the playing song";
+        if (jobs.empty()) { message = "Nothing to shrink in " + what + notes; return; }
+
+        std::error_code ec;
+        fs::create_directories(incoming_dir(), ec);
+        shrinking = true;
+        shrink_done = shrink_failed = 0;
+        shrink_saved = 0;
+        shrink_error.clear();
+        shrinker.start(std::move(jobs), kShrinkBitrate);
+        message = "Shrinking " + what + " (" + plural(shrinker.count(), "file") + ") to 48 kbps" + notes;
+    }
+
+    // Called on every event: swaps finished files into the library.
+    void check_shrink() {
+        if (mode != Mode::Normal) return;  // wait until the user isn't typing
+        bool finished = !shrinker.busy();  // checked first: then every result is already in
+        std::vector<ShrinkResult> results = shrinker.take_results();
+        for (const ShrinkResult& r : results) finish_shrink(r);
+        if (!results.empty()) load();
+        if (finished && shrinking) {
+            shrinking = false;
+            message = "Shrunk " + plural(shrink_done, "file") + ", saved " + human_size(shrink_saved) +
+                      " (originals in the trash)";
+            if (shrink_failed) message += " · " + std::to_string(shrink_failed) + " failed: " + shrink_error;
+        }
+    }
+
+    // Replace one file with its shrunk copy: the original goes to the trash,
+    // and if the name changed (Money.mp3 -> Money.opus), library.tsv,
+    // playlists and the saved position follow it.
+    void finish_shrink(const ShrinkResult& r) {
+        const fs::path& old = r.job.in;
+        const fs::path& small = r.job.out;
+        std::error_code ec;
+        auto fail = [&](const std::string& why) {
+            fs::remove(small, ec);
+            ++shrink_failed;
+            shrink_error = why;
+        };
+        if (!r.ok) return fail(r.error);
+        auto it = track_index.find(old.string());
+        if (it == track_index.end() || tracks[it->second].missing) return fail("deleted while shrinking");
+        if (it->second == playing) return fail("it started playing");
+        Track& t = tracks[it->second];
+
+        std::uintmax_t before = fs::file_size(old, ec), after = fs::file_size(small, ec);
+        if (ec || after >= before) { fs::remove(small, ec); return; }  // no smaller: keep the original
+        write_tags(small, t.title, t.artist == "Unknown Artist" ? "" : t.artist, t.album, t.number);
+
+        fs::path dest = old;
+        dest.replace_extension(".opus");
+        if (dest != old && fs::exists(dest)) dest = free_path(old.parent_path(), old.stem().string(), ".opus");
+        std::string error;
+        if (!move_to_trash(old, error)) return fail(error);
+        if (!move_file(small, dest)) {
+            ++shrink_failed;
+            shrink_error = "couldn't move the new file into place (the original is in the trash)";
+            return;
+        }
+        if (dest != old) {
+            t.path = dest;
+            for (Playlist& pl : playlists) {
+                bool changed = false;
+                for (fs::path& p : pl.songs)
+                    if (p == old) { p = dest; changed = true; }
+                if (changed) save(pl);
+            }
+            if (auto p = progress.find(rel(old)); p != progress.end()) {
+                progress[rel(dest)] = p->second;
+                progress.erase(rel(old));
+                progress_dirty = true;
+                save_progress(true);
+            }
+            save_manifest();
+        }
+        ++shrink_done;
+        shrink_saved += before - after;
     }
 
     void set_source(const std::string& url) {
@@ -1776,6 +1901,7 @@ struct App {
         else if (verb == "delete") delete_playlist();
         else if (verb == "sync") sync(arg);
         else if (verb == "podcast") mark_podcast(arg);
+        else if (verb == "shrink") shrink();
         else if (verb == "source") set_source(arg);
         else if (verb == "forget") forget_song();
         else if (!verb.empty() && std::all_of(verb.begin(), verb.end(), ::isdigit)) {
@@ -1853,6 +1979,7 @@ struct App {
     bool on_event(const Event& e) {
         bool handled = handle_event(e);
         check_download();  // after the key too, in case it just closed a prompt
+        check_shrink();
         return handled;
     }
 
@@ -2332,7 +2459,11 @@ struct App {
         Element download = downloader.busy()
             ? text(" ⇣ downloading " + of + std::to_string(downloader.percent()) + "%" + queued + " ") | color(Color::Cyan)
             : text("");
-        return hbox({mode_tag | bold, rest | flex, download, text(right) | dim});
+        Element shrink = shrinker.busy()
+            ? text(" ⇲ shrinking " + std::to_string(shrinker.item()) + "/" + std::to_string(shrinker.count()) + " " +
+                   std::to_string(shrinker.percent()) + "% ") | color(Color::Cyan)
+            : text("");
+        return hbox({mode_tag | bold, rest | flex, download, shrink, text(right) | dim});
     }
 
     // A "type or pick" box's suggestion lines, plus whether the value is new.
@@ -2489,6 +2620,7 @@ struct App {
             line(":sync", "download every missing song"),
             line(":sync artist / album", "just the selected artist's / album's"),
             line(":podcast [on|off]", "mark the selected song / album / artist as a podcast"),
+            line(":shrink", "re-encode the selected song / album / artist to 48 kbps"),
             line(":source URL", "set where the song can be downloaded"),
             line(":forget", "remove a missing song from the list"),
         });

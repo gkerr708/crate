@@ -23,7 +23,7 @@ pkg_check_modules(TAGLIB REQUIRED IMPORTED_TARGET taglib)
 # the visualizer just says it's unavailable.
 pkg_check_modules(PULSE IMPORTED_TARGET libpulse-simple)
 
-add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp src/progress.cpp src/visualizer.cpp)
+add_executable(crate src/main.cpp src/library.cpp src/player.cpp src/download.cpp src/playlist.cpp src/manifest.cpp src/progress.cpp src/visualizer.cpp src/shrink.cpp)
 target_compile_options(crate PRIVATE -Wall -Wextra)
 target_link_libraries(crate PRIVATE
     ftxui::screen ftxui::dom ftxui::component

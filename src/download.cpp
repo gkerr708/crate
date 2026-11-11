@@ -56,6 +56,13 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
         "yt-dlp", playlist ? "--yes-playlist" : "--no-playlist", "--extract-audio", "--audio-format", format,
         "--audio-quality", quality, "--embed-metadata", "--color", "never", "--newline", "--progress",
     };
+    if (quality != "0") {
+        // A low bitrate was asked for. yt-dlp only applies --audio-quality
+        // when it converts, and YouTube's audio is usually Opus already, so
+        // it would just copy the full-size stream. Instead pick YouTube's own
+        // low-bitrate stream (about 50-64 kbps); elsewhere, the smallest one.
+        args.insert(args.end(), {"--format", "bestaudio[abr<=64]/worstaudio/bestaudio"});
+    }
     if (playlist) {
         args.insert(args.end(), {
             // Keep going past unavailable / private videos.

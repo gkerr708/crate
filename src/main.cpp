@@ -73,6 +73,8 @@ struct Cursor {
 };
 
 enum class Pane { Artists, Albums, Songs };
+constexpr int kArtistsWidth = 30;  // the songs pane gets whatever is left
+constexpr int kAlbumsWidth = 36;
 enum class Mode { Normal, Search, Command, Url, Tag, Pick, Confirm, Rename };
 
 // The first two rows of the artists pane are special.
@@ -1176,12 +1178,9 @@ struct App {
             if (no_link) {
                 // Keeping the details is only useful if it can be downloaded
                 // again, so say when it can't before trashing it.
-                std::string these = no_link == 1 && paths.size() == 1 ? "This song has"
-                                  : no_link == 1                      ? "1 of these songs has"
-                                                                      : std::to_string(no_link) + " of these songs have";
+                std::string these = paths.size() == 1 ? "No link" : std::to_string(no_link) + " with no link";
                 confirm_action = [this, paths, these] {
-                    confirm_text = these + " no link: its title, artist and album stay in your library, but"
-                                   " :sync can't download it again (:source <url> adds a link). Delete the audio? (y/n)";
+                    confirm_text = these + ": details kept, but can't redownload. Delete? (y/n)";
                     confirm_action = [this, paths] { really_delete(paths, false); };
                     mode = Mode::Confirm;
                 };
@@ -2035,7 +2034,7 @@ struct App {
                          text(" " + plural(n, "artist")), [&](int i) {
             if (i == kPlaylists) return text(" " + artists[i] + " ") | color(Color::Cyan);
             return text(" " + artists[i] + " ");
-        }) | (stretches(Pane::Artists) ? flex : size(WIDTH, EQUAL, 24));
+        }) | (stretches(Pane::Artists) ? flex : size(WIDTH, EQUAL, kArtistsWidth));
     }
 
     Element draw_groups() {
@@ -2060,13 +2059,13 @@ struct App {
                                 text(" Press A on a song to add") | dim, text(" it to a new playlist, or") | dim,
                                 text(" type :new Name") | dim}) | flex);
         }
-        return body | (stretches(Pane::Albums) ? flex : size(WIDTH, EQUAL, 30));
+        return body | (stretches(Pane::Albums) ? flex : size(WIDTH, EQUAL, kAlbumsWidth));
     }
 
     Element draw_songs() {
         // Drop the album, then the artist column when there isn't room,
         // so the title always gets space.
-        int inner = cols - 2 - (visible(Pane::Artists) ? 24 : 0) - (visible(Pane::Albums) ? 30 : 0);
+        int inner = cols - 2 - (visible(Pane::Artists) ? kArtistsWidth : 0) - (visible(Pane::Albums) ? kAlbumsWidth : 0);
         bool show_album = inner >= 70, show_artist = inner >= 45;
         auto columns = [=](Element mark, Element title, Element artist, Element album, Element time) {
             Elements cells = {mark | size(WIDTH, EQUAL, 2), title | flex};

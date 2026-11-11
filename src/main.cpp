@@ -223,7 +223,9 @@ struct App {
     std::vector<int> songs;            // right pane: indices into `tracks`
     std::vector<int> slots;            // in a playlist: songs[i] is entry slots[i] of it
     Cursor artist_cur, group_cur, song_cur;
-    std::string filter;                // active search text
+    std::string filter;                // active search text (songs pane)
+    std::string jump;                  // last / search in the artists or albums pane
+    int jump_origin = 0;               // where the cursor was when that search began
 
     // --- UI ---
     Pane pane = Pane::Artists;  // start in the artists pane
@@ -1568,14 +1570,48 @@ struct App {
         else if (!verb.empty()) message = "Unknown command: " + verb;
     }
 
+    // Name of row i in the artists or albums pane, for / search.
+    std::string row_name(int i) const {
+        return pane == Pane::Artists ? artists[i] : groups[i].label;
+    }
+
+    // In the artists / albums pane, / jumps to a matching row rather than
+    // filtering. Look for `needle` starting at row `from`, stepping by `dir`
+    // and wrapping round; returns -1 if nothing matches.
+    int find_row(const std::string& needle, int from, int dir) const {
+        int size = list_size();
+        if (needle.empty() || size == 0) return -1;
+        std::string want = lower(needle);
+        for (int k = 0; k < size; ++k) {
+            int i = ((from + dir * k) % size + size) % size;
+            if (lower(row_name(i)).find(want) != std::string::npos) return i;
+        }
+        return -1;
+    }
+
+    // n / N: the next / previous match of the last search in this pane.
+    void jump_again(int dir) {
+        if (pane == Pane::Songs) { message = "n / N work in the artists and albums panes"; return; }
+        if (jump.empty()) { message = "No search yet (press / to search)"; return; }
+        int i = find_row(jump, cur().sel + dir, dir);
+        if (i < 0) message = "Not found: " + jump;
+        else move_to(i);
+    }
+
     // Typing after /, : or the URL prompt
     bool on_input_key(const Event& e) {
+        bool jumping = mode == Mode::Search && pane != Pane::Songs;
         if (e == Event::Escape) {
-            if (mode == Mode::Search) { filter.clear(); refresh_songs(); }
+            if (jumping) move_to(jump_origin);  // back to where the search began
+            else if (mode == Mode::Search) { filter.clear(); refresh_songs(); }
             mode = Mode::Normal;
         } else if (e == Event::Return) {
             Mode was = mode;
             mode = Mode::Normal;
+            if (jumping) {
+                jump = input;
+                if (!input.empty() && find_row(input, jump_origin, 1) < 0) message = "Not found: " + input;
+            }
             if (was == Mode::Command) run_command(input);
             if (was == Mode::Url && !trim(input).empty()) start_add(trim(input));
         } else if (e == Event::CtrlU) {
@@ -1588,7 +1624,10 @@ struct App {
         } else {
             return true;
         }
-        if (mode == Mode::Search) {  // search filters live as you type
+        if (jumping) {  // jump to the first match as you type
+            int i = find_row(input, jump_origin, 1);
+            move_to(i >= 0 ? i : jump_origin);
+        } else if (mode == Mode::Search) {  // search filters live as you type
             filter = input;
             set_pane(static_cast<int>(Pane::Songs));
             refresh_songs();
@@ -1806,7 +1845,13 @@ struct App {
         else if (c == "e") begin_edit();
 
         // --- modes ---
-        else if (c == "/") { mode = Mode::Search; input = filter; }
+        else if (c == "/") {
+            mode = Mode::Search;
+            if (in_songs) input = filter;
+            else { input.clear(); jump_origin = cur().sel; }
+        }
+        else if (c == "n") jump_again(+1);
+        else if (c == "N") jump_again(-1);
         else if (c == ":") { mode = Mode::Command; input.clear(); }
         else if (e == Event::Escape) {
             if (visual >= 0) visual = -1;
@@ -2161,7 +2206,8 @@ struct App {
             line("Ctrl-d / Ctrl-u", "half page down / up"),
             line("h / l / Tab", "pane left / right"),
             line("o", "jump to the playing song"),
-            line("/", "search (Esc clears)"),
+            line("/", "search: filters songs; jumps to a match in artists / albums (Esc clears)"),
+            line("n / N", "next / previous match (artists / albums)"),
             heading("Playing"),
             line("Enter", "play song (or open the pane to the right)"),
             line("Space", "pause / resume"),

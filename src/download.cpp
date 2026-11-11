@@ -1,6 +1,7 @@
 #include "download.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -184,6 +185,35 @@ static std::string trim(std::string s) {
     return start == std::string::npos ? "" : s.substr(start, end - start + 1);
 }
 
+// Removes junk left loose at the end, outside brackets:
+// "Money | Lyrics", "Money - Lyric Video", "Money Lyrics" -> "Money".
+// Without this, "Money | Lyrics" would split into artist "Money", title "Lyrics".
+static std::string strip_trailing_junk(std::string s) {
+    static const std::vector<std::string> tails = {
+        "with lyrics", "lyrics video", "lyric video", "lyrics", "lyric",
+        "official music video", "official video", "official audio", "music video", "visualizer",
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        s = trim(s);
+        std::string low = lower(s);
+        for (const auto& tail : tails) {
+            if (low.size() <= tail.size() || !low.ends_with(tail)) continue;
+            // Only a whole word: "Lyrics" yes, the end of "Lyricsmith" no.
+            char before = low[low.size() - tail.size() - 1];
+            if (std::isalnum(static_cast<unsigned char>(before))) continue;
+            std::string rest = trim(s.substr(0, s.size() - tail.size()));
+            while (!rest.empty() && (rest.back() == ':' || rest.back() == '/' || rest.back() == ',')) rest.pop_back();
+            rest = trim(rest);
+            if (rest.empty()) continue;  // the whole title is "Lyrics": leave it
+            s = rest;
+            changed = true;
+            break;
+        }
+    }
+    return s;
+}
+
 // Removes "(Official Video)", "[HD]", "(Lyrics)" and similar chunks.
 static std::string strip_junk(std::string s) {
     static const std::vector<std::string> junk = {
@@ -201,7 +231,7 @@ static std::string strip_junk(std::string s) {
             else from = to + 1;
         }
     }
-    return trim(s);
+    return strip_trailing_junk(s);
 }
 
 std::string clean_title(const std::string& video_title) { return strip_junk(video_title); }

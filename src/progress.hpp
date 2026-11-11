@@ -1,6 +1,6 @@
-// Listening progress for long tracks (podcasts, audiobooks): <library>/progress.tsv
+// Listening progress for podcasts (and audiobooks): <library>/progress.tsv
 //
-// Remembers where you stopped in anything longer than kLongTrack, so it
+// Remembers where you stopped in anything marked as a podcast, so it
 // picks up there next time, and which ones you've finished. Like
 // library.tsv it lives in the library folder, so keeping the folder in git
 // carries your place between computers (and your phone).
@@ -13,9 +13,6 @@
 #include <filesystem>
 #include <map>
 #include <string>
-
-// Tracks at least this long (in seconds) remember their position.
-constexpr int kLongTrack = 20 * 60;
 
 struct Progress {
     int seconds = 0;    // where you stopped

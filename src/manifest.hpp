@@ -6,8 +6,9 @@
 // from their source URL (:sync).
 //
 // Format: tab-separated columns, lines starting with # are comments.
-//   path  artist  album  title  seconds  source  [track]
-// `track` (the track number) is only written when the song has one.
+//   path  artist  album  title  seconds  source  [track]  [podcast]
+// `track` (the track number) is only written when the song has one, and
+// the last column holds the word "podcast" for podcasts, else nothing.
 // `path` is relative to the library folder, e.g. "Tool/Lateralus/Schism.opus".
 #pragma once
 
@@ -23,6 +24,7 @@ struct ManifestEntry {
     int seconds = 0;
     std::string source;  // URL it was downloaded from, "" if unknown
     int number = 0;      // track number on the album, 0 if unknown
+    bool podcast = false;
 };
 
 std::filesystem::path manifest_path(const std::filesystem::path& library);

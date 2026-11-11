@@ -14,6 +14,7 @@ struct Track {
     int seconds = 0;     // length, 0 if unknown
     bool missing = false;  // listed in library.tsv but not downloaded on this computer
     std::string source;    // URL it can be downloaded from, "" if unknown
+    bool podcast = false;  // podcast / audiobook: remembers where you stopped, plays at its own speed
 };
 
 // Sorts by artist, album, track number, then title.

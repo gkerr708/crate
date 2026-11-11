@@ -36,6 +36,7 @@
 #include <mutex>
 #include <random>
 #include <stop_token>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -76,6 +77,12 @@ enum class Pane { Artists, Albums, Songs };
 constexpr int kArtistsWidth = 30;  // the songs pane gets whatever is left
 constexpr int kAlbumsWidth = 36;
 enum class Mode { Normal, Search, Command, Url, Tag, Pick, Confirm, Rename };
+// What the URL prompt adds: as = one video as a song, aa = a playlist as
+// an album, ap = one video as a podcast (low bitrate, keeps your place).
+enum class AddKind { Song, Album, Podcast };
+// Podcasts are speech, which sounds fine at a fraction of music's bitrate.
+constexpr const char* kPodcastFormat = "opus";
+constexpr const char* kPodcastQuality = "48K";
 
 // The first two rows of the artists pane are special.
 constexpr int kAllArtists = 0;
@@ -93,13 +100,14 @@ struct Group {
 // The Title / Artist / Album form, used for new downloads (`a`) and for
 // editing an existing song's tags (`e`).
 struct TagForm {
-    enum Field { Title, Artist, Album };
+    enum Field { Title, Artist, Album, Podcast };  // Podcast is a yes/no toggle
     fs::path file;
     bool is_new = false;     // a fresh download, to be moved into the library on save
-    std::string fields[3];   // what's typed in each field
+    std::string fields[4];   // what's typed in each field (Podcast's is unused)
     int field = Title;       // the field being edited
     int pick = -1;           // highlighted suggestion; -1 = use what's typed
     std::string source;      // URL it was downloaded from
+    bool podcast = false;    // the Podcast toggle; ap starts it on
 
     // A downloaded playlist, saved as one album: Title isn't asked (each
     // song's comes from its video), only Artist and Album.
@@ -279,6 +287,8 @@ struct App {
     std::vector<std::string> restore_queue;  // missing songs (relative paths) waiting to download
     std::string restoring;                   // the one downloading now, "" if none
     std::string last_url;                    // what was typed in the `a` prompt
+    AddKind add_kind = AddKind::Song;        // which of as / aa / ap opened it
+    std::set<std::string> pending_podcasts;  // new files to mark as podcasts, until the next load()
 
     // --- playback ---
     std::vector<int> queue;  // what we're playing through (indices into tracks)
@@ -395,11 +405,14 @@ struct App {
             std::string r = rel(t.path);
             if (auto it = listed.find(r); it != listed.end()) {
                 t.source = it->second.source;
+                t.podcast = it->second.podcast;
                 listed.erase(it);
             }
             if (auto it = pending_sources.find(r); it != pending_sources.end()) t.source = it->second;
+            if (pending_podcasts.count(r)) t.podcast = true;
         }
         pending_sources.clear();
+        pending_podcasts.clear();
 
         for (auto& [path, e] : listed) {  // what's left isn't on this computer
             Track t;
@@ -410,6 +423,7 @@ struct App {
             t.seconds = e.seconds;
             t.source = e.source;
             t.number = e.number;
+            t.podcast = e.podcast;
             t.missing = true;
             tracks.push_back(std::move(t));
         }
@@ -421,7 +435,7 @@ struct App {
         std::vector<ManifestEntry> entries;
         for (const Track& t : tracks) {
             entries.push_back({rel(t.path), t.artist == "Unknown Artist" ? "" : t.artist, t.album, t.title,
-                               t.seconds, t.source, t.number});
+                               t.seconds, t.source, t.number, t.podcast});
         }
         std::sort(entries.begin(), entries.end(),
                   [](const ManifestEntry& a, const ManifestEntry& b) { return a.path < b.path; });
@@ -557,8 +571,8 @@ struct App {
     // =================================================================
     // Playback
     // =================================================================
-    // Long tracks (podcasts, audiobooks) remember where you stopped.
-    bool is_long(int track) const { return tracks[track].seconds >= kLongTrack; }
+    // Podcasts remember where you stopped and play at their own speed.
+    bool is_podcast(int track) const { return tracks[track].podcast; }
 
     const Progress* progress_of(int track) const {
         auto it = progress.find(rel(tracks[track].path));
@@ -567,7 +581,7 @@ struct App {
 
     // Record where we are in the playing track, if it's a long one.
     void note_progress() {
-        if (playing < 0 || !is_long(playing) || player.loading()) return;
+        if (playing < 0 || !is_podcast(playing) || player.loading()) return;
         int pos = static_cast<int>(player.position());
         if (pos <= 0) return;
         Progress& p = progress[rel(tracks[playing].path)];
@@ -591,36 +605,36 @@ struct App {
         note_progress();  // remember where we left the previous one
         save_progress(true);
         playing = track;
-        // Resume a long track where you stopped, backing up a few seconds
+        // Resume a podcast where you stopped, backing up a few seconds
         // to catch the thread again. Finished ones start over.
         double from = 0;
-        if (const Progress* p = progress_of(track); is_long(track) && p && !p->done && p->seconds > 10) {
+        if (const Progress* p = progress_of(track); is_podcast(track) && p && !p->done && p->seconds > 10) {
             from = p->seconds - 5;
         }
         player.play(tracks[track].path.string(), from);
         player.set_speed(speed_of(track));
     }
 
-    // The speed a track plays at: music always 1×, long tracks their artist's speed.
+    // The speed a track plays at: music always 1×, podcasts their artist's speed.
     double speed_of(int track) const {
-        if (!is_long(track)) return 1.0;
+        if (!is_podcast(track)) return 1.0;
         auto it = artist_speed.find(lower(tracks[track].artist));
         return it != artist_speed.end() ? it->second : long_speed;
     }
 
-    // What < / > adjust: the playing long track's artist, else the default.
+    // What < / > adjust: the playing podcast's artist, else the default.
     double current_speed() const {
-        return playing >= 0 && is_long(playing) ? speed_of(playing) : long_speed;
+        return playing >= 0 && is_podcast(playing) ? speed_of(playing) : long_speed;
     }
 
-    // < / > and :speed. Applies to long tracks only (podcasts, audiobooks).
+    // < / > and :speed. Applies to podcasts only.
     // While one is playing, sets the speed for its artist; otherwise the
     // default for artists that don't have one yet.
     void set_long_speed(double speed) {
         speed = std::clamp(std::round(speed * 100) / 100, 0.5, 3.0);
         std::error_code ec;
         fs::create_directories(state_file("speed").parent_path(), ec);
-        if (playing >= 0 && is_long(playing)) {
+        if (playing >= 0 && is_podcast(playing)) {
             const std::string& artist = tracks[playing].artist;
             artist_speed[lower(artist)] = speed;
             player.set_speed(speed);
@@ -630,7 +644,7 @@ struct App {
             return;
         }
         long_speed = speed;
-        message = "Default speed " + format_speed(speed) + " for long tracks (artists you've set keep theirs)";
+        message = "Default speed " + format_speed(speed) + " for podcasts (ones you've set keep theirs)";
         if (FILE* f = std::fopen(state_file("speed").c_str(), "w")) {
             std::fprintf(f, "%g\n", long_speed);
             std::fclose(f);
@@ -657,7 +671,7 @@ struct App {
 
     // A track played to its end on its own.
     void finished() {
-        if (playing >= 0 && is_long(playing)) {
+        if (playing >= 0 && is_podcast(playing)) {
             progress[rel(tracks[playing].path)] = {0, true};
             progress_dirty = true;
         }
@@ -999,6 +1013,7 @@ struct App {
             {".opus", "opus"}, {".m4a", "m4a"}, {".mp3", "mp3"}, {".flac", "flac"},
             {".ogg", "vorbis"}, {".wav", "wav"}, {".aac", "aac"},
         };
+        if (t->podcast) return (void)downloader.start(t->source, incoming_dir(), kPodcastFormat, false, kPodcastQuality);
         auto f = formats.find(lower(t->path.extension().string()));
         downloader.start(t->source, incoming_dir(), f == formats.end() ? "best" : f->second);
     }
@@ -1019,6 +1034,7 @@ struct App {
             // Got a different format after all: keep the new extension.
             dest.replace_extension(result.file.extension());
             pending_sources[rel(dest)] = t->source;
+            if (t->podcast) pending_podcasts.insert(rel(dest));
             tracks.erase(tracks.begin() + track_index[copy.path.string()]);  // drop the old entry
             save_manifest();
         }
@@ -1074,6 +1090,37 @@ struct App {
         for (int i : picked) if (tracks[i].missing) missing.push_back(rel(tracks[i].path));
         if (missing.empty()) message = "Everything in " + where + " is already downloaded";
         else restore(missing);
+    }
+
+    // :podcast [on|off]: mark (or unmark) the selected song, album or artist
+    // as a podcast. Without on/off it flips, going by the first song.
+    void mark_podcast(const std::string& arg) {
+        if (arg != "" && arg != "on" && arg != "off") { message = "Usage: :podcast [on|off]"; return; }
+        std::vector<int> picked;
+        std::string what;
+        if (pane == Pane::Songs) {
+            if (songs.empty()) return;
+            auto [first, last] = row_range(1);
+            picked.assign(songs.begin() + first, songs.begin() + last + 1);
+            what = picked.size() == 1 ? tracks[picked[0]].title : plural(picked.size(), "song");
+        } else if (pane == Pane::Artists) {
+            if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) { message = "Select an artist first"; return; }
+            for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
+                if (lower(tracks[i].artist) == lower(artists[artist_cur.sel])) picked.push_back(i);
+            what = artists[artist_cur.sel];
+        } else {
+            if (groups.empty() || groups[group_cur.sel].kind != Group::Album) { message = "Select an album first"; return; }
+            const Group& g = groups[group_cur.sel];
+            for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
+                if (lower(tracks[i].artist) == lower(g.artist) && lower(tracks[i].album) == lower(g.album)) picked.push_back(i);
+            what = g.label;
+        }
+        if (picked.empty()) return;
+        bool on = arg == "on" ? true : arg == "off" ? false : !tracks[picked[0]].podcast;
+        for (int i : picked) tracks[i].podcast = on;
+        visual = -1;
+        save_manifest();
+        message = what + (on ? " is now a podcast (keeps your place, < / > speed)" : " is no longer a podcast");
     }
 
     void set_source(const std::string& url) {
@@ -1255,12 +1302,13 @@ struct App {
     // Adding songs and editing tags
     // =================================================================
 
-    // `a`: ask for a URL, pre-filled from the clipboard.
-    void begin_add() {
+    // as / aa / ap: ask for a URL, pre-filled from the clipboard.
+    void begin_add(AddKind kind) {
         if (downloader.busy() || !restoring.empty()) {
             message = "A download is already running";
             return;
         }
+        add_kind = kind;
         mode = Mode::Url;
         input = clipboard_url();
     }
@@ -1269,21 +1317,24 @@ struct App {
     // album; a video that's in a playlist asks which one is meant.
     void start_add(const std::string& url) {
         last_url = url;
-        auto song = [this, url] {
-            downloader.start(url, incoming_dir());
-            message = "Downloading…";
-        };
-        auto album = [this, url] {
+        if (add_kind == AddKind::Album) {
+            if (playlist_id(url).empty()) { message = "That isn't a playlist link (as adds a single song)"; return; }
             downloader.start(url, incoming_dir(), "best", true);
             message = "Downloading playlist…";
-        };
-        if (playlist_id(url).empty()) return song();
-        if (!names_video(url)) return album();
-        confirm_text = "This video is in a playlist: y = just this song · a = the whole playlist as an album · n = cancel [Y/a/n]";
-        confirm_action = song;
-        confirm_all = album;
-        confirm_enter = true;
-        mode = Mode::Confirm;
+            return;
+        }
+        // A song or podcast is one video: a link to just a playlist has none.
+        if (!playlist_id(url).empty() && !names_video(url)) {
+            message = "That's a playlist link: aa adds it as an album";
+            return;
+        }
+        if (add_kind == AddKind::Podcast) {
+            downloader.start(url, incoming_dir(), kPodcastFormat, false, kPodcastQuality);
+            message = "Downloading podcast…";
+        } else {
+            downloader.start(url, incoming_dir());
+            message = "Downloading…";
+        }
     }
 
     // Called on every event: opens the form when a download has finished.
@@ -1304,14 +1355,18 @@ struct App {
 
         // Pre-fill from the tags yt-dlp wrote, e.g. title "Tool - Schism (Official Video)".
         Track t = read_track(result->file);
-        TitleGuess guess = guess_from_title(t.title);
-        std::string artist = guess.artist;
-        if (artist.empty() && t.artist != "Unknown Artist") artist = clean_channel(t.artist);
+        bool podcast = add_kind == AddKind::Podcast;
+        std::string channel = t.artist != "Unknown Artist" ? clean_channel(t.artist) : "";
+        // A podcast's title isn't "Artist - Song" ("AMA - Nov 2026"), so don't
+        // split it; its artist is the channel.
+        TitleGuess guess = podcast ? TitleGuess{clean_title(t.title), channel} : guess_from_title(t.title);
+        std::string artist = guess.artist.empty() ? channel : guess.artist;
 
         form = {};
         form.file = result->file;
         form.is_new = true;
         form.source = result->source.empty() ? last_url : result->source;
+        form.podcast = podcast;
         form.fields[TagForm::Title] = guess.title;
         form.fields[TagForm::Artist] = match_known(TagForm::Artist, artist);
         form.fields[TagForm::Album] = match_known(TagForm::Album, t.album);
@@ -1377,6 +1432,7 @@ struct App {
         form.fields[TagForm::Title] = t.title;
         form.fields[TagForm::Artist] = t.artist == "Unknown Artist" ? "" : t.artist;
         form.fields[TagForm::Album] = t.album;
+        form.podcast = t.podcast;
         mode = Mode::Tag;
     }
 
@@ -1467,7 +1523,7 @@ struct App {
     }
 
     std::vector<std::string> suggestions() const {
-        if (form.field == TagForm::Title) return {};
+        if (form.field == TagForm::Title || form.field == TagForm::Podcast) return {};
         return complete(known_values(form.field), form.fields[form.field]);
     }
 
@@ -1482,6 +1538,7 @@ struct App {
 
     // Lock in the current field's value before moving to another field.
     void commit_field() {
+        if (form.field == TagForm::Podcast) return;
         form.fields[form.field] = form.field == TagForm::Title ? trim(form_value())
                                                                : match_known(form.field, form_value());
         form.pick = -1;
@@ -1525,6 +1582,12 @@ struct App {
         }
 
         fs::path final_path = form.file;
+        if (!form.is_new) {  // the Podcast toggle lives in library.tsv, not the file's tags
+            if (auto it = track_index.find(form.file.string()); it != track_index.end()) {
+                tracks[it->second].podcast = form.podcast;
+                save_manifest();
+            }
+        }
         if (form.is_new) {
             // File it as ~/Music/Artist/Album/Title.ext
             fs::path folder = dir / safe_filename(artist.empty() ? "Unknown Artist" : artist);
@@ -1535,6 +1598,7 @@ struct App {
                 return;
             }
             pending_sources[rel(final_path)] = form.source;  // recorded in library.tsv by load()
+            if (form.podcast) pending_podcasts.insert(rel(final_path));
         }
         load();
         select_path(final_path);
@@ -1605,18 +1669,26 @@ struct App {
     bool on_form_key(const Event& e) {
         int n_sugg = static_cast<int>(suggestions().size());
         int first = form.batch.empty() ? TagForm::Title : TagForm::Artist;  // a playlist has no Title to ask
+        int last = form.batch.empty() ? TagForm::Podcast : TagForm::Album;
         auto go_to_field = [&](int f) {
             commit_field();
-            form.field = std::clamp(f, first, 2);
+            form.field = std::clamp(f, first, last);
         };
 
         if (e == Event::Escape) cancel_form();
         else if (e == Event::Return) {
-            if (form.field == TagForm::Album) save_form();
+            // Enter on Album saves too: the Podcast toggle is a Tab away when wanted.
+            if (form.field >= TagForm::Album) save_form();
             else go_to_field(form.field + 1);
         }
-        else if (e == Event::Tab) go_to_field(form.field == 2 ? first : form.field + 1);
-        else if (e == Event::TabReverse) go_to_field(form.field == first ? 2 : form.field - 1);
+        else if (e == Event::Tab) go_to_field(form.field == last ? first : form.field + 1);
+        else if (e == Event::TabReverse) go_to_field(form.field == first ? last : form.field - 1);
+        else if (form.field == TagForm::Podcast) {  // a yes/no toggle, not text
+            std::string c = e.is_character() ? e.character() : "";
+            if (c == " ") form.podcast = !form.podcast;
+            else if (c == "y") form.podcast = true;
+            else if (c == "n") form.podcast = false;
+        }
         // Ctrl-n / Ctrl-p walk the suggestions like vim's completion menu;
         // stepping past either end goes back to what you typed.
         else if (e == Event::CtrlN || e == Event::ArrowDown) {
@@ -1703,6 +1775,7 @@ struct App {
         else if (verb == "rename") rename_playlist(arg);
         else if (verb == "delete") delete_playlist();
         else if (verb == "sync") sync(arg);
+        else if (verb == "podcast") mark_podcast(arg);
         else if (verb == "source") set_source(arg);
         else if (verb == "forget") forget_song();
         else if (!verb.empty() && std::all_of(verb.begin(), verb.end(), ::isdigit)) {
@@ -1922,6 +1995,12 @@ struct App {
                 else delete_group();
             }
             if (first == 'd' && c == "r") delete_album_here();
+            if (first == 'a') {
+                if (c == "s") begin_add(AddKind::Song);
+                else if (c == "a") begin_add(AddKind::Album);
+                else if (c == "p") begin_add(AddKind::Podcast);
+                else message = "Add: as = song · aa = album (playlist) · ap = podcast";
+            }
             if (first == 'd' && c == "a") delete_artist_here();
             return true;
         }
@@ -1983,7 +2062,7 @@ struct App {
         else if (c == "K") songs_only([&] { move_song(-1); });
 
         // --- library ---
-        else if (c == "a") begin_add();
+        else if (c == "a") start_pending('a');
         else if (c == "e") begin_edit();
 
         // --- modes ---
@@ -2028,12 +2107,23 @@ struct App {
         return window(text(title) | (active ? color(Color::Green) : dim) | bold, vbox(std::move(lines)) | flex);
     }
 
+    // The playing song's row, and its artist's and album's, are green.
+    // Green text clashes with the unfocused highlight's background, so on
+    // that row it's bold instead.
+    Element mark_playing(Element row, Pane which, int i, int sel) const {
+        bool on_dim_highlight = i == sel && pane != which;
+        return on_dim_highlight ? row | bold : row | color(Color::Green);
+    }
+
     Element draw_artists() {
         int n = static_cast<int>(artists.size()) - 2;
+        std::string playing_artist = playing >= 0 ? lower(tracks[playing].artist) : "";
         return draw_list(" Artists ", Pane::Artists, artist_cur, artists.size(),
                          text(" " + plural(n, "artist")), [&](int i) {
             if (i == kPlaylists) return text(" " + artists[i] + " ") | color(Color::Cyan);
-            return text(" " + artists[i] + " ");
+            Element row = text(" " + artists[i] + " ");
+            if (i == kAllArtists || playing < 0 || lower(artists[i]) != playing_artist) return row;
+            return mark_playing(row, Pane::Artists, i, artist_cur.sel);
         }) | (stretches(Pane::Artists) ? flex : size(WIDTH, EQUAL, kArtistsWidth));
     }
 
@@ -2048,10 +2138,13 @@ struct App {
                 return hbox({text(" ♫ " + g.label) | color(Color::Cyan) | flex,
                              text(" " + std::to_string(playlists[g.playlist].songs.size()) + " ") | dim});
             }
-            if (g.kind == Group::Album && artist_cur.sel == kAllArtists) {
-                return hbox({text(" " + g.label), text("  " + g.artist) | dim});
-            }
-            return text(" " + g.label + " ");
+            Element row = g.kind == Group::Album && artist_cur.sel == kAllArtists
+                ? hbox({text(" " + g.label), text("  " + g.artist) | dim})
+                : text(" " + g.label + " ");
+            bool has_playing = g.kind == Group::Album && playing >= 0 &&
+                               lower(tracks[playing].artist) == lower(g.artist) &&
+                               lower(tracks[playing].album) == lower(g.album);
+            return has_playing ? mark_playing(row, Pane::Albums, i, group_cur.sel) : row;
         });
         if (lists && groups.empty()) {
             body = window(text(" Playlists ") | bold | (pane == Pane::Albums ? color(Color::Green) : dim),
@@ -2098,7 +2191,7 @@ struct App {
             // Long tracks: ◐ part-way (showing time left), ✓ finished.
             std::string time = format_time(t.seconds);
             bool done = false;
-            if (const Progress* p = progress_of(songs[i]); p && is_long(songs[i])) {
+            if (const Progress* p = progress_of(songs[i]); p && is_podcast(songs[i])) {
                 done = p->done;
                 if (mark.empty()) mark = p->done ? "✓" : p->seconds > 0 ? "◐" : "";
                 if (!p->done && p->seconds > 0) time = "-" + format_time(t.seconds - p->seconds);
@@ -2106,10 +2199,7 @@ struct App {
             Element row = columns(text(mark), text(t.title), text(t.artist), text(t.album), text(time));
             if (t.missing || (done && !is_playing)) return row | dim;
             if (!is_playing) return row;
-            // Green text clashes with the unfocused highlight's background,
-            // so on that row the playing song is bold instead (▶ still marks it).
-            bool on_dim_highlight = i == song_cur.sel && pane != Pane::Songs;
-            return on_dim_highlight ? row | bold : row | color(Color::Green);
+            return mark_playing(row, Pane::Songs, i, song_cur.sel);  // ▶ marks it too
         }, [&](int i) { return i >= lo && i <= hi; }) | flex;
     }
 
@@ -2217,7 +2307,8 @@ struct App {
             rest = hbox({text(" New " + rename_subject() + " name: "), text(input + "▏"),
                          text("   Enter save · Esc cancel") | dim});
         } else if (mode == Mode::Url) {
-            mode_tag = tag("ADD", Color::Cyan);
+            mode_tag = tag(add_kind == AddKind::Album ? "ADD ALBUM" : add_kind == AddKind::Podcast ? "ADD PODCAST" : "ADD SONG",
+                           Color::Cyan);
             rest = hbox({text(" URL: "), text(input + "▏"), text("   Enter download · Esc cancel") | dim});
         } else if (mode == Mode::Tag || mode == Mode::Pick) {
             mode_tag = tag(mode == Mode::Tag ? "TAG" : "PLAYLIST", Color::Blue);
@@ -2260,7 +2351,7 @@ struct App {
     }
 
     Element draw_form() const {
-        static const char* labels[] = {"Title", "Artist", "Album"};
+        static const char* labels[] = {"Title", "Artist", "Album", "Podcast"};
         static const char* nouns[] = {"title", "artist", "album"};
         static const char* album_labels[] = {"Songs", "Artist", "Album"};
         bool batch = !form.batch.empty();
@@ -2270,11 +2361,22 @@ struct App {
             if (form.failed) note += " · " + std::to_string(form.failed) + " unavailable, skipped";
             lines.push_back(text(note) | dim);
         } else {
-            lines.push_back(text(form.file.filename().string()) | dim);
+            std::string note = form.file.filename().string();
+            if (form.podcast) note = "Podcast · " + note;
+            lines.push_back(text(note) | dim);
         }
         lines.push_back(text(""));
 
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < (batch ? 3 : 4); ++i) {
+            if (i == TagForm::Podcast) {
+                bool active = form.field == i;
+                Element label = text(std::string(active ? "› " : "  ") + labels[i]) | size(WIDTH, EQUAL, 10);
+                Element value = text(form.podcast ? "yes" : "no");
+                Element hint = text(active ? "   Space toggles · keeps your place, plays at its own speed" : "") | dim;
+                lines.push_back(active ? hbox({label | color(Color::Green) | bold, value | bold, hint})
+                                       : hbox({label | dim, value}));
+                continue;
+            }
             if (batch && i == TagForm::Title) {  // not editable: just says how many
                 lines.push_back(hbox({text(std::string("  ") + album_labels[i]) | size(WIDTH, EQUAL, 10) | dim,
                                       text(form.fields[i]) | dim}));
@@ -2305,6 +2407,8 @@ struct App {
 
         if (form.field == TagForm::Title) {
             lines.push_back(text("The song's name") | dim);
+        } else if (form.field == TagForm::Podcast) {
+            lines.push_back(text("Podcasts remember where you stopped and play at their own speed (< / >)") | dim);
         } else if (form.field == TagForm::Album && trim(form.fields[TagForm::Artist]).empty()) {
             lines.push_back(text("Albums are suggested once the artist is set") | dim);
         } else {
@@ -2318,7 +2422,8 @@ struct App {
 
         lines.push_back(separator());
         lines.push_back(text("Enter next/save · Tab fields · Ctrl-n/p pick · Ctrl-u clear · Esc cancel") | dim);
-        std::string title = batch ? " Add playlist as album " : form.is_new ? " Add song " : " Edit tags ";
+        std::string title = batch ? " Add playlist as album " : !form.is_new ? " Edit tags "
+                          : form.podcast ? " Add podcast " : " Add song ";
         return window(text(title) | bold | color(Color::Green), vbox(std::move(lines))) |
                size(WIDTH, EQUAL, 76) | clear_under | center;
     }
@@ -2363,7 +2468,8 @@ struct App {
             line("v / b / i", "mini / big spectrum, now playing"),
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Library"),
-            line("a / e", "add song from URL / edit tags (or rename the artist / album)"),
+            line("as / aa / ap", "add a song / an album (playlist) / a podcast from a URL"),
+            line("e", "edit tags (or rename the artist / album)"),
             line("", "a playlist URL adds the whole playlist as an album"),
             line("dd", "delete song (or the album / artist pane's selection)"),
             line("dr / da", "delete the album (albums pane) / artist (artists pane)"),
@@ -2382,6 +2488,7 @@ struct App {
             line("Enter on ⇣", "download that song"),
             line(":sync", "download every missing song"),
             line(":sync artist / album", "just the selected artist's / album's"),
+            line(":podcast [on|off]", "mark the selected song / album / artist as a podcast"),
             line(":source URL", "set where the song can be downloaded"),
             line(":forget", "remove a missing song from the list"),
         });

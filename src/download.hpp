@@ -47,8 +47,9 @@ public:
     // Starts downloading `url` into `out_dir`. False if one is already running.
     // `format` is a yt-dlp audio format: best (keep the original), opus, mp3, ...
     // With `playlist`, every video of the playlist the URL points at is downloaded.
+    // `quality` is yt-dlp's --audio-quality: "0" is the best, "48K" a bitrate.
     bool start(const std::string& url, const std::filesystem::path& out_dir,
-               const std::string& format = "best", bool playlist = false);
+               const std::string& format = "best", bool playlist = false, const std::string& quality = "0");
 
     bool busy() const { return busy_; }
     int percent() const { return percent_; }
@@ -61,7 +62,7 @@ public:
     std::optional<DownloadResult> take_result();
 
 private:
-    void run(std::string url, std::filesystem::path out_dir, std::string format, bool playlist);
+    void run(std::string url, std::filesystem::path out_dir, std::string format, bool playlist, std::string quality);
 
     std::function<void()> on_change_;
     std::thread worker_;

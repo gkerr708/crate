@@ -27,7 +27,7 @@ std::vector<ManifestEntry> read_manifest(const fs::path& library) {
         std::stringstream ss(line);
         std::string col;
         while (std::getline(ss, col, '\t')) cols.push_back(col);
-        cols.resize(7);  // missing trailing columns become ""
+        cols.resize(8);  // missing trailing columns become ""
 
         ManifestEntry e;
         e.path = cols[0];
@@ -37,6 +37,7 @@ std::vector<ManifestEntry> read_manifest(const fs::path& library) {
         e.seconds = std::atoi(cols[4].c_str());
         e.source = cols[5];
         e.number = std::atoi(cols[6].c_str());
+        e.podcast = cols[7] == "podcast";
         if (!e.path.empty()) out.push_back(std::move(e));
     }
     return out;
@@ -49,7 +50,9 @@ bool write_manifest(const fs::path& library, const std::vector<ManifestEntry>& e
     for (const ManifestEntry& e : entries) {
         out << clean(e.path) << '\t' << clean(e.artist) << '\t' << clean(e.album) << '\t'
             << clean(e.title) << '\t' << e.seconds << '\t' << clean(e.source);
-        if (e.number > 0) out << '\t' << e.number;  // left off otherwise, so older lines don't change
+        // Left off when unset, so older lines don't change.
+        if (e.number > 0 || e.podcast) out << '\t' << (e.number > 0 ? std::to_string(e.number) : "");
+        if (e.podcast) out << "\tpodcast";
         out << '\n';
     }
     std::string text = out.str();

@@ -22,14 +22,14 @@ Downloader::~Downloader() {
 }
 
 bool Downloader::start(const std::string& url, const fs::path& out_dir, const std::string& format,
-                       bool playlist) {
+                       bool playlist, const std::string& quality) {
     if (busy_) return false;
     if (worker_.joinable()) worker_.join();  // the previous, finished download
     busy_ = true;
     percent_ = 0;
     item_ = 0;
     item_count_ = 0;
-    worker_ = std::thread(&Downloader::run, this, url, out_dir, format, playlist);
+    worker_ = std::thread(&Downloader::run, this, url, out_dir, format, playlist, quality);
     return true;
 }
 
@@ -40,7 +40,7 @@ std::optional<DownloadResult> Downloader::take_result() {
     return r;
 }
 
-void Downloader::run(std::string url, fs::path out_dir, std::string format, bool playlist) {
+void Downloader::run(std::string url, fs::path out_dir, std::string format, bool playlist, std::string quality) {
     fs::create_directories(out_dir);
     std::string out = (out_dir / "%(title)s [%(id)s].%(ext)s").string();
 
@@ -54,7 +54,7 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
     // and progress lines get "3/12" (which video, out of how many) added.
     std::vector<std::string> args = {
         "yt-dlp", playlist ? "--yes-playlist" : "--no-playlist", "--extract-audio", "--audio-format", format,
-        "--audio-quality", "0", "--embed-metadata", "--color", "never", "--newline", "--progress",
+        "--audio-quality", quality, "--embed-metadata", "--color", "never", "--newline", "--progress",
     };
     if (playlist) {
         args.insert(args.end(), {

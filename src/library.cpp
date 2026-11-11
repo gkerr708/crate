@@ -56,13 +56,14 @@ Track read_track(const fs::path& path) {
 }
 
 bool write_tags(const fs::path& path, const std::string& title, const std::string& artist,
-                const std::string& album) {
+                const std::string& album, int number) {
     TagLib::FileRef file(path.c_str());
     if (file.isNull() || !file.tag()) return false;
     // TagLib stores text in its own String type; tell it ours is UTF-8.
     file.tag()->setTitle(TagLib::String(title, TagLib::String::UTF8));
     file.tag()->setArtist(TagLib::String(artist, TagLib::String::UTF8));
     file.tag()->setAlbum(TagLib::String(album, TagLib::String::UTF8));
+    if (number > 0) file.tag()->setTrack(static_cast<unsigned int>(number));
     return file.save();
 }
 

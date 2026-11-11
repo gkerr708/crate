@@ -26,9 +26,10 @@ std::vector<Track> scan_library(const std::filesystem::path& dir);
 // Reads one file's tags.
 Track read_track(const std::filesystem::path& path);
 
-// Writes title/artist/album into the file's tags. False if that failed.
+// Writes title/artist/album into the file's tags, and the track number if
+// `number` is above 0 (otherwise the existing one is kept). False if that failed.
 bool write_tags(const std::filesystem::path& path, const std::string& title,
-                const std::string& artist, const std::string& album);
+                const std::string& artist, const std::string& album, int number = 0);
 
 // Moves a file to the desktop trash (~/.local/share/Trash), so it can be
 // restored from a file manager. On failure returns false and sets `error`.

@@ -98,6 +98,12 @@ struct TagForm {
     int field = Title;       // the field being edited
     int pick = -1;           // highlighted suggestion; -1 = use what's typed
     std::string source;      // URL it was downloaded from
+
+    // A downloaded playlist, saved as one album: Title isn't asked (each
+    // song's comes from its video), only Artist and Album.
+    std::vector<PlaylistItem> batch;
+    std::vector<std::string> video_titles;  // batch[i]'s video title, from its tags
+    int failed = 0;                         // videos that didn't download
 };
 
 // Where downloads wait until they're tagged: ~/.cache/crate/incoming
@@ -139,6 +145,21 @@ static std::string format_speed(double speed) {
     char buf[16];
     std::snprintf(buf, sizeof(buf), "%g×", speed);
     return buf;
+}
+
+// The playlist a URL points at (YouTube's list=...), or "" if none. Mixes
+// (list=RD...) are endless auto-generated radio, not a playlist to keep.
+static std::string playlist_id(const std::string& url) {
+    auto pos = url.find("list=");
+    if (pos == std::string::npos || (pos > 0 && url[pos - 1] != '?' && url[pos - 1] != '&')) return "";
+    std::string id = url.substr(pos + 5, url.find('&', pos) - pos - 5);
+    return id.starts_with("RD") ? "" : id;
+}
+
+// Whether a URL also names one video (watch?v=..., youtu.be/...), as when
+// it's copied while a playlist is playing.
+static bool names_video(const std::string& url) {
+    return url.find("v=") != std::string::npos || url.find("youtu.be/") != std::string::npos;
 }
 
 // What's on the Wayland clipboard, if it looks like a URL.
@@ -358,6 +379,7 @@ struct App {
             t.album = e.album;
             t.seconds = e.seconds;
             t.source = e.source;
+            t.number = e.number;
             t.missing = true;
             tracks.push_back(std::move(t));
         }
@@ -369,7 +391,7 @@ struct App {
         std::vector<ManifestEntry> entries;
         for (const Track& t : tracks) {
             entries.push_back({rel(t.path), t.artist == "Unknown Artist" ? "" : t.artist, t.album, t.title,
-                               t.seconds, t.source});
+                               t.seconds, t.source, t.number});
         }
         std::sort(entries.begin(), entries.end(),
                   [](const ManifestEntry& a, const ManifestEntry& b) { return a.path < b.path; });
@@ -970,7 +992,7 @@ struct App {
             tracks.erase(tracks.begin() + track_index[copy.path.string()]);  // drop the old entry
             save_manifest();
         }
-        write_tags(result.file, t->title, t->artist == "Unknown Artist" ? "" : t->artist, t->album);
+        write_tags(result.file, t->title, t->artist == "Unknown Artist" ? "" : t->artist, t->album, t->number);
         std::string title = t->title;
         if (!move_file(result.file, dest)) {
             message = "Downloaded " + title + ", but couldn't move it to " + dest.string();
@@ -1159,6 +1181,27 @@ struct App {
         input = clipboard_url();
     }
 
+    // Download what was typed in the `a` prompt. A playlist URL becomes an
+    // album; a video that's in a playlist asks which one is meant.
+    void start_add(const std::string& url) {
+        last_url = url;
+        auto song = [this, url] {
+            downloader.start(url, incoming_dir());
+            message = "Downloading…";
+        };
+        auto album = [this, url] {
+            downloader.start(url, incoming_dir(), "best", true);
+            message = "Downloading playlist…";
+        };
+        if (playlist_id(url).empty()) return song();
+        if (!names_video(url)) return album();
+        confirm_text = "This video is in a playlist: y = just this song · a = the whole playlist as an album · n = cancel [Y/a/n]";
+        confirm_action = song;
+        confirm_all = album;
+        confirm_enter = true;
+        mode = Mode::Confirm;
+    }
+
     // Called on every event: opens the form when a download has finished.
     void check_download() {
         if (mode != Mode::Normal) return;  // wait until the user isn't typing
@@ -1173,6 +1216,7 @@ struct App {
             message = "Download failed: " + result->error;
             return;
         }
+        if (result->playlist) return begin_album(*result);
 
         // Pre-fill from the tags yt-dlp wrote, e.g. title "Tool - Schism (Official Video)".
         Track t = read_track(result->file);
@@ -1190,6 +1234,53 @@ struct App {
         form.field = TagForm::Title;
         mode = Mode::Tag;
         message.clear();
+    }
+
+    // A playlist finished downloading: ask for its artist and album once.
+    void begin_album(const DownloadResult& result) {
+        form = {};
+        form.is_new = true;
+        form.source = last_url;
+        form.batch = result.items;
+        form.failed = result.failed;
+
+        // The artist: what most video titles start with ("Tool - Schism"),
+        // else the playlist's channel ("Tool - Topic"), else the first song's tag.
+        std::unordered_map<std::string, int> votes;
+        std::string artist, first_tag;
+        int best = 0;
+        for (const PlaylistItem& item : form.batch) {
+            Track t = read_track(item.file);
+            form.video_titles.push_back(t.title);
+            if (first_tag.empty() && t.artist != "Unknown Artist") first_tag = clean_channel(t.artist);
+            std::string guessed = guess_from_title(t.title).artist;
+            if (guessed.empty()) continue;
+            int v = ++votes[lower(guessed)];
+            if (v > best) { best = v; artist = guessed; }
+        }
+        if (best * 2 <= static_cast<int>(form.batch.size())) artist = clean_channel(result.uploader);
+        if (artist.empty()) artist = first_tag;
+
+        // YouTube Music names album playlists "Album - <name>".
+        std::string album = result.playlist_title;
+        if (album.starts_with("Album - ")) album.erase(0, 8);
+
+        form.fields[TagForm::Title] = plural(form.batch.size(), "song");
+        form.fields[TagForm::Artist] = match_known(TagForm::Artist, artist);
+        form.fields[TagForm::Album] = match_known(TagForm::Album, trim(album));
+        form.field = TagForm::Artist;
+        mode = Mode::Tag;
+        message.clear();
+    }
+
+    // A playlist song's title: its video title, minus the artist in front
+    // when that's the album's artist ("Tool - Schism" -> "Schism"). Other
+    // " - " parts are kept, so "Schism - Live" stays whole.
+    static std::string album_song_title(const std::string& video_title, const std::string& artist) {
+        TitleGuess g = guess_from_title(video_title);
+        if (!g.artist.empty() && lower(g.artist) == lower(artist) && !g.title.empty()) return g.title;
+        std::string t = clean_title(video_title);
+        return t.empty() ? video_title : t;
     }
 
     // `e`: edit the selected song's tags.
@@ -1270,6 +1361,7 @@ struct App {
 
     void save_form() {
         commit_field();
+        if (!form.batch.empty()) return save_album();
         const std::string& title = form.fields[TagForm::Title];
         const std::string& artist = form.fields[TagForm::Artist];
         const std::string& album = form.fields[TagForm::Album];
@@ -1301,10 +1393,55 @@ struct App {
         message = "Saved: " + title + (artist.empty() ? "" : " — " + artist);
     }
 
+    void save_album() {
+        const std::string& artist = form.fields[TagForm::Artist];
+        const std::string& album = form.fields[TagForm::Album];
+        mode = Mode::Normal;
+        fs::path folder = dir / safe_filename(artist.empty() ? "Unknown Artist" : artist);
+        if (!album.empty()) folder /= safe_filename(album);
+
+        int saved = 0, problems = 0;
+        fs::path first;
+        for (size_t i = 0; i < form.batch.size(); ++i) {
+            const PlaylistItem& item = form.batch[i];
+            std::string title = album_song_title(form.video_titles[i], artist);
+            fs::path to = free_path(folder, safe_filename(title), item.file.extension().string());
+            if (!write_tags(item.file, title, artist, album, item.index) || !move_file(item.file, to)) {
+                // Keep it where cancel would have put it rather than losing it.
+                fs::path unsorted = free_path(dir / "Unsorted", item.file.stem().string(), item.file.extension().string());
+                if (move_file(item.file, unsorted)) pending_sources[rel(unsorted)] = item.source;
+                ++problems;
+                continue;
+            }
+            pending_sources[rel(to)] = item.source;  // recorded in library.tsv by load()
+            if (first.empty()) first = to;
+            ++saved;
+        }
+        load();
+        if (!first.empty()) select_path(first);
+        message = "Saved " + plural(saved, "song") + " to " + (album.empty() ? "no album" : album) +
+                  (artist.empty() ? "" : " — " + artist);
+        if (problems) message += " · " + std::to_string(problems) + " couldn't be tagged (left in Unsorted/)";
+        if (form.failed) message += " · " + std::to_string(form.failed) + " unavailable on YouTube";
+    }
+
     void cancel_form() {
         mode = Mode::Normal;
         if (!form.is_new) {
             message = "Edit cancelled";
+            return;
+        }
+        if (!form.batch.empty()) {  // keep the whole playlist, untagged, in Unsorted/
+            fs::path first;
+            for (const PlaylistItem& item : form.batch) {
+                fs::path to = free_path(dir / "Unsorted", item.file.stem().string(), item.file.extension().string());
+                if (!move_file(item.file, to)) continue;
+                pending_sources[rel(to)] = item.source;
+                if (first.empty()) first = to;
+            }
+            load();
+            if (!first.empty()) select_path(first);
+            message = "Kept " + plural(form.batch.size(), "song") + " untagged in Unsorted/ (press e to tag them later)";
             return;
         }
         // Don't throw a download away: keep it, untagged, in ~/Music/Unsorted.
@@ -1319,9 +1456,10 @@ struct App {
 
     bool on_form_key(const Event& e) {
         int n_sugg = static_cast<int>(suggestions().size());
+        int first = form.batch.empty() ? TagForm::Title : TagForm::Artist;  // a playlist has no Title to ask
         auto go_to_field = [&](int f) {
             commit_field();
-            form.field = std::clamp(f, 0, 2);
+            form.field = std::clamp(f, first, 2);
         };
 
         if (e == Event::Escape) cancel_form();
@@ -1329,8 +1467,8 @@ struct App {
             if (form.field == TagForm::Album) save_form();
             else go_to_field(form.field + 1);
         }
-        else if (e == Event::Tab) go_to_field((form.field + 1) % 3);
-        else if (e == Event::TabReverse) go_to_field((form.field + 2) % 3);
+        else if (e == Event::Tab) go_to_field(form.field == 2 ? first : form.field + 1);
+        else if (e == Event::TabReverse) go_to_field(form.field == first ? 2 : form.field - 1);
         // Ctrl-n / Ctrl-p walk the suggestions like vim's completion menu;
         // stepping past either end goes back to what you typed.
         else if (e == Event::CtrlN || e == Event::ArrowDown) {
@@ -1439,11 +1577,7 @@ struct App {
             Mode was = mode;
             mode = Mode::Normal;
             if (was == Mode::Command) run_command(input);
-            if (was == Mode::Url && !trim(input).empty()) {
-                last_url = trim(input);
-                downloader.start(last_url, incoming_dir());
-                message = "Downloading…";
-            }
+            if (was == Mode::Url && !trim(input).empty()) start_add(trim(input));
         } else if (e == Event::CtrlU) {
             input.clear();
         } else if (e == Event::Backspace) {
@@ -1908,8 +2042,13 @@ struct App {
         }
         std::string right = plural(songs.size(), "song") + "  ? help ";
         std::string queued = restore_queue.empty() ? "" : " +" + std::to_string(restore_queue.size());
+        std::string of;  // "3/12 " in a playlist
+        if (downloader.item() > 0) {
+            of = std::to_string(downloader.item()) +
+                 (downloader.item_count() > 0 ? "/" + std::to_string(downloader.item_count()) : "") + " ";
+        }
         Element download = downloader.busy()
-            ? text(" ⇣ downloading " + std::to_string(downloader.percent()) + "%" + queued + " ") | color(Color::Cyan)
+            ? text(" ⇣ downloading " + of + std::to_string(downloader.percent()) + "%" + queued + " ") | color(Color::Cyan)
             : text("");
         return hbox({mode_tag | bold, rest | flex, download, text(right) | dim});
     }
@@ -1932,11 +2071,24 @@ struct App {
     Element draw_form() const {
         static const char* labels[] = {"Title", "Artist", "Album"};
         static const char* nouns[] = {"title", "artist", "album"};
+        static const char* album_labels[] = {"Songs", "Artist", "Album"};
+        bool batch = !form.batch.empty();
         Elements lines;
-        lines.push_back(text(form.file.filename().string()) | dim);
+        if (batch) {
+            std::string note = "Every song gets this artist and album, numbered in playlist order";
+            if (form.failed) note += " · " + std::to_string(form.failed) + " unavailable, skipped";
+            lines.push_back(text(note) | dim);
+        } else {
+            lines.push_back(text(form.file.filename().string()) | dim);
+        }
         lines.push_back(text(""));
 
         for (int i = 0; i < 3; ++i) {
+            if (batch && i == TagForm::Title) {  // not editable: just says how many
+                lines.push_back(hbox({text(std::string("  ") + album_labels[i]) | size(WIDTH, EQUAL, 10) | dim,
+                                      text(form.fields[i]) | dim}));
+                continue;
+            }
             bool active = i == form.field;
             std::string value = active ? form_value() : form.fields[i];
             Element label = text(std::string(active ? "› " : "  ") + labels[i]) | size(WIDTH, EQUAL, 10);
@@ -1945,6 +2097,19 @@ struct App {
             lines.push_back(active ? hbox({label | color(Color::Green) | bold, field | bold})
                                    : hbox({label | dim, field}));
         }
+        if (batch) {  // what the songs will be called, with the artist set now
+            lines.push_back(separator());
+            const std::string& artist = form.field == TagForm::Artist ? form_value() : form.fields[TagForm::Artist];
+            int shown = std::min<int>(form.batch.size(), 8);
+            for (int i = 0; i < shown; ++i) {
+                std::string n = std::to_string(form.batch[i].index);
+                lines.push_back(hbox({text(std::string(n.size() < 2 ? " " : "") + n + "  ") | dim,
+                                      text(album_song_title(form.video_titles[i], artist))}));
+            }
+            if (static_cast<int>(form.batch.size()) > shown)
+                lines.push_back(text("    … and " + std::to_string(form.batch.size() - shown) + " more") | dim);
+        }
+
         lines.push_back(separator());
 
         if (form.field == TagForm::Title) {
@@ -1962,7 +2127,7 @@ struct App {
 
         lines.push_back(separator());
         lines.push_back(text("Enter next/save · Tab fields · Ctrl-n/p pick · Ctrl-u clear · Esc cancel") | dim);
-        std::string title = form.is_new ? " Add song " : " Edit tags ";
+        std::string title = batch ? " Add playlist as album " : form.is_new ? " Add song " : " Edit tags ";
         return window(text(title) | bold | color(Color::Green), vbox(std::move(lines))) |
                size(WIDTH, EQUAL, 76) | clear_under | center;
     }
@@ -2007,6 +2172,7 @@ struct App {
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Library"),
             line("a / e", "add song from URL / edit tags"),
+            line("", "a playlist URL adds the whole playlist as an album"),
             line("dd", "delete song (or the album / artist pane's selection)"),
             line("dr / da", "delete the album (albums pane) / artist (artists pane)"),
             line("", "asks: y/Enter = downloads only, a = also forget it, n = cancel"),

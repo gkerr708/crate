@@ -1,5 +1,7 @@
 #include "download.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -18,12 +20,15 @@ Downloader::~Downloader() {
     if (worker_.joinable()) worker_.join();
 }
 
-bool Downloader::start(const std::string& url, const fs::path& out_dir, const std::string& format) {
+bool Downloader::start(const std::string& url, const fs::path& out_dir, const std::string& format,
+                       bool playlist) {
     if (busy_) return false;
     if (worker_.joinable()) worker_.join();  // the previous, finished download
     busy_ = true;
     percent_ = 0;
-    worker_ = std::thread(&Downloader::run, this, url, out_dir, format);
+    item_ = 0;
+    item_count_ = 0;
+    worker_ = std::thread(&Downloader::run, this, url, out_dir, format, playlist);
     return true;
 }
 
@@ -34,20 +39,39 @@ std::optional<DownloadResult> Downloader::take_result() {
     return r;
 }
 
-void Downloader::run(std::string url, fs::path out_dir, std::string format) {
+void Downloader::run(std::string url, fs::path out_dir, std::string format, bool playlist) {
     fs::create_directories(out_dir);
     std::string out = (out_dir / "%(title)s [%(id)s].%(ext)s").string();
 
     // --print makes yt-dlp quiet and print only what we ask for:
     //   "PROGRESS  45.3%" lines while downloading, then "FILE /path/x.opus"
     //   and "URL https://..." (the page it came from).
+    //
+    // A playlist download instead prints, for every video that made it,
+    //   "ITEM 3 https://... /path/x.opus" (position, page, file),
+    //   "TITLE <playlist title>" and "UPLOADER <channel>",
+    // and progress lines get "3/12" (which video, out of how many) added.
     std::vector<std::string> args = {
-        "yt-dlp", "--no-playlist", "--extract-audio", "--audio-format", format,
-        "--audio-quality", "0", "--embed-metadata", "--color", "never",
-        "--newline", "--progress", "--progress-template", "download:PROGRESS %(progress._percent_str)s",
-        "--print", "after_move:FILE %(filepath)s", "--print", "after_move:URL %(webpage_url)s",
-        "--output", out, "--", url,
+        "yt-dlp", playlist ? "--yes-playlist" : "--no-playlist", "--extract-audio", "--audio-format", format,
+        "--audio-quality", "0", "--embed-metadata", "--color", "never", "--newline", "--progress",
     };
+    if (playlist) {
+        args.insert(args.end(), {
+            // Keep going past unavailable / private videos.
+            "--ignore-errors",
+            "--progress-template",
+            "download:PROGRESS %(progress._percent_str)s %(info.playlist_index)s/%(info.n_entries)s",
+            "--print", "after_move:ITEM %(playlist_index)s %(webpage_url)s %(filepath)s",
+            "--print", "after_move:TITLE %(playlist_title)s",
+            "--print", "after_move:UPLOADER %(playlist_uploader,channel,uploader)s",
+        });
+    } else {
+        args.insert(args.end(), {
+            "--progress-template", "download:PROGRESS %(progress._percent_str)s",
+            "--print", "after_move:FILE %(filepath)s", "--print", "after_move:URL %(webpage_url)s",
+        });
+    }
+    args.insert(args.end(), {"--output", out, "--", url});
     std::vector<char*> argv;
     for (auto& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
@@ -55,6 +79,8 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format) {
     // A pipe: yt-dlp writes into one end, we read from the other.
     int pipe_fds[2];
     DownloadResult result;
+    result.playlist = playlist;
+    int errors = 0;
     if (pipe(pipe_fds) != 0) {
         result.error = "couldn't create a pipe";
     } else {
@@ -84,12 +110,37 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format) {
                     buffer.erase(0, nl + 1);
                     if (line.starts_with("PROGRESS")) {
                         int p = static_cast<int>(std::atof(line.c_str() + 8));
-                        if (p != percent_) { percent_ = p; on_change_(); }
+                        int i = 0, count = 0;
+                        // "PROGRESS   1.0% 3/12": the percentage is space-padded, so take the last word.
+                        if (auto sp = line.rfind(' '); playlist && sp != std::string::npos)
+                            std::sscanf(line.c_str() + sp + 1, "%d/%d", &i, &count);
+                        if (p != percent_ || i != item_ || count != item_count_) {
+                            percent_ = p;
+                            item_ = i;
+                            item_count_ = count;
+                            on_change_();
+                        }
+                    } else if (line.starts_with("ITEM ")) {
+                        // "ITEM <index> <url> <path>": the path may contain spaces, the others can't.
+                        auto a = line.find(' ', 5);
+                        auto b = a == std::string::npos ? a : line.find(' ', a + 1);
+                        if (b != std::string::npos) {
+                            PlaylistItem item;
+                            item.index = std::atoi(line.substr(5, a - 5).c_str());
+                            item.source = line.substr(a + 1, b - a - 1);
+                            item.file = line.substr(b + 1);
+                            if (fs::exists(item.file)) result.items.push_back(std::move(item));
+                        }
+                    } else if (line.starts_with("TITLE ")) {
+                        if (result.playlist_title.empty()) result.playlist_title = line.substr(6);
+                    } else if (line.starts_with("UPLOADER ")) {
+                        if (result.uploader.empty()) result.uploader = line.substr(9);
                     } else if (line.starts_with("FILE ")) {
                         result.file = line.substr(5);
                     } else if (line.starts_with("URL ")) {
                         result.source = line.substr(4);
                     } else if (!line.empty()) {
+                        if (line.starts_with("ERROR")) ++errors;
                         last_line = line;
                     }
                 }
@@ -97,8 +148,19 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format) {
             int status = 0;
             waitpid(pid, &status, 0);
             pid_ = -1;
-            result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
-                        !result.file.empty() && fs::exists(result.file);
+            if (playlist) {
+                // Some videos failing doesn't fail the playlist; none making it does.
+                for (std::string* s : {&result.playlist_title, &result.uploader})
+                    if (*s == "NA") s->clear();
+                std::stable_sort(result.items.begin(), result.items.end(),
+                                 [](const PlaylistItem& a, const PlaylistItem& b) { return a.index < b.index; });
+                int n = static_cast<int>(result.items.size());
+                result.failed = std::max(errors, item_count_ > n ? item_count_ - n : 0);
+                result.ok = n > 0;
+            } else {
+                result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                            !result.file.empty() && fs::exists(result.file);
+            }
             if (!result.ok) result.error = last_line.empty() ? "download failed" : last_line;
         }
         close(pipe_fds[0]);
@@ -141,6 +203,8 @@ static std::string strip_junk(std::string s) {
     }
     return trim(s);
 }
+
+std::string clean_title(const std::string& video_title) { return strip_junk(video_title); }
 
 TitleGuess guess_from_title(const std::string& video_title) {
     std::string t = strip_junk(video_title);

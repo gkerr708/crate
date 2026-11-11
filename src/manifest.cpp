@@ -27,7 +27,7 @@ std::vector<ManifestEntry> read_manifest(const fs::path& library) {
         std::stringstream ss(line);
         std::string col;
         while (std::getline(ss, col, '\t')) cols.push_back(col);
-        cols.resize(6);  // missing trailing columns become ""
+        cols.resize(7);  // missing trailing columns become ""
 
         ManifestEntry e;
         e.path = cols[0];
@@ -36,6 +36,7 @@ std::vector<ManifestEntry> read_manifest(const fs::path& library) {
         e.title = cols[3];
         e.seconds = std::atoi(cols[4].c_str());
         e.source = cols[5];
+        e.number = std::atoi(cols[6].c_str());
         if (!e.path.empty()) out.push_back(std::move(e));
     }
     return out;
@@ -47,7 +48,9 @@ bool write_manifest(const fs::path& library, const std::vector<ManifestEntry>& e
         << "# path\tartist\talbum\ttitle\tseconds\tsource\n";
     for (const ManifestEntry& e : entries) {
         out << clean(e.path) << '\t' << clean(e.artist) << '\t' << clean(e.album) << '\t'
-            << clean(e.title) << '\t' << e.seconds << '\t' << clean(e.source) << '\n';
+            << clean(e.title) << '\t' << e.seconds << '\t' << clean(e.source);
+        if (e.number > 0) out << '\t' << e.number;  // left off otherwise, so older lines don't change
+        out << '\n';
     }
     std::string text = out.str();
 

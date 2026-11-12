@@ -425,6 +425,9 @@ struct App {
             if (auto it = listed.find(r); it != listed.end()) {
                 t.source = it->second.source;
                 t.podcast = it->second.podcast;
+                // A copy whose file has no number (e.g. on another computer
+                // before :order ran there) still sorts by the listed one.
+                if (t.number == 0) t.number = it->second.number;
                 listed.erase(it);
             }
             if (auto it = pending_sources.find(r); it != pending_sources.end()) t.source = it->second;

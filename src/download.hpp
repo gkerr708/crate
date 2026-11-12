@@ -20,6 +20,8 @@ struct PlaylistItem {
     int index = 0;               // position in the playlist, from 1 (0 if unknown)
     std::filesystem::path file;
     std::string source;          // the video's own page URL
+    std::string title;           // its video title (lookup() only: there's no file to read tags from)
+    int seconds = 0;             // its length (lookup() only), 0 if unknown
 };
 
 struct DownloadResult {
@@ -34,6 +36,13 @@ struct DownloadResult {
     int failed = 0;                   // videos that couldn't be downloaded
     std::string playlist_title;
     std::string uploader;             // the playlist's channel, or the first video's
+
+    // lookup() only: nothing was downloaded (`file` is empty), just these.
+    bool info_only = false;
+    std::string title;   // the video title
+    std::string artist;  // what yt-dlp would tag as the artist (often the channel)
+    std::string album;
+    int seconds = 0;
 };
 
 class Downloader {
@@ -52,6 +61,10 @@ public:
     bool start(const std::string& url, const std::filesystem::path& out_dir,
                const std::string& format = "best", bool playlist = false, const std::string& quality = "0");
 
+    // Like start(), but downloads nothing: only reads the title, length and
+    // page URL of the video (or, with `playlist`, of every video in it).
+    bool lookup(const std::string& url, bool playlist = false);
+
     bool busy() const { return busy_; }
     int percent() const { return percent_; }
     // In a playlist download: which video is downloading (from 1), and how
@@ -63,7 +76,10 @@ public:
     std::optional<DownloadResult> take_result();
 
 private:
-    void run(std::string url, std::filesystem::path out_dir, std::string format, bool playlist, std::string quality);
+    bool launch(std::string url, std::filesystem::path out_dir, std::string format, bool playlist,
+                std::string quality, bool info_only);
+    void run(std::string url, std::filesystem::path out_dir, std::string format, bool playlist, std::string quality,
+             bool info_only);
 
     std::function<void()> on_change_;
     std::thread worker_;

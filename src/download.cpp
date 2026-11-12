@@ -23,13 +23,23 @@ Downloader::~Downloader() {
 
 bool Downloader::start(const std::string& url, const fs::path& out_dir, const std::string& format,
                        bool playlist, const std::string& quality) {
+    return launch(url, out_dir, format, playlist, quality, false);
+}
+
+bool Downloader::lookup(const std::string& url, bool playlist) {
+    return launch(url, {}, "", playlist, "", true);
+}
+
+bool Downloader::launch(std::string url, fs::path out_dir, std::string format, bool playlist,
+                        std::string quality, bool info_only) {
     if (busy_) return false;
     if (worker_.joinable()) worker_.join();  // the previous, finished download
     busy_ = true;
     percent_ = 0;
     item_ = 0;
     item_count_ = 0;
-    worker_ = std::thread(&Downloader::run, this, url, out_dir, format, playlist, quality);
+    worker_ = std::thread(&Downloader::run, this, std::move(url), std::move(out_dir), std::move(format), playlist,
+                          std::move(quality), info_only);
     return true;
 }
 
@@ -40,7 +50,9 @@ std::optional<DownloadResult> Downloader::take_result() {
     return r;
 }
 
-void Downloader::run(std::string url, fs::path out_dir, std::string format, bool playlist, std::string quality) {
+static std::vector<std::string> build_download_args(const std::string& url, const fs::path& out_dir,
+                                                     const std::string& format, bool playlist,
+                                                     const std::string& quality) {
     fs::create_directories(out_dir);
     std::string out = (out_dir / "%(title)s [%(id)s].%(ext)s").string();
 
@@ -80,6 +92,40 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
         });
     }
     args.insert(args.end(), {"--output", out, "--", url});
+    return args;
+}
+
+void Downloader::run(std::string url, fs::path out_dir, std::string format, bool playlist, std::string quality,
+                     bool info_only) {
+    std::vector<std::string> args;
+    if (info_only) {
+        // --print alone downloads nothing. A playlist is read flat (just its
+        // list of videos, without opening each one), which is quick:
+        //   "ENTRY <index> <seconds> <url> <title>" per video, plus TITLE / UPLOADER.
+        // One video prints NAME, ARTIST, ALBUM, SECONDS and URL lines.
+        args = {"yt-dlp", "--color", "never"};
+        if (playlist) {
+            args.insert(args.end(), {
+                "--yes-playlist", "--flat-playlist", "--ignore-errors",
+                "--print", "ENTRY %(playlist_index)s %(duration)s %(webpage_url,url)s %(title)s",
+                "--print", "TITLE %(playlist_title)s",
+                "--print", "UPLOADER %(playlist_uploader,playlist_channel,channel,uploader)s",
+            });
+        } else {
+            args.insert(args.end(), {
+                "--no-playlist",
+                "--print", "NAME %(title)s",
+                "--print", "ARTIST %(artist,creator,uploader,channel)s",
+                "--print", "ALBUM %(album)s",
+                "--print", "SECONDS %(duration)s",
+                "--print", "URL %(webpage_url)s",
+            });
+        }
+        args.insert(args.end(), {"--", url});
+    } else {
+        args = build_download_args(url, out_dir, format, playlist, quality);
+    }
+
     std::vector<char*> argv;
     for (auto& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
@@ -88,6 +134,8 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
     int pipe_fds[2];
     DownloadResult result;
     result.playlist = playlist;
+    result.info_only = info_only;
+    int skipped = 0;  // lookup(): unavailable videos listed in the playlist
     int errors = 0;
     if (pipe(pipe_fds) != 0) {
         result.error = "couldn't create a pipe";
@@ -139,6 +187,28 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
                             item.file = line.substr(b + 1);
                             if (fs::exists(item.file)) result.items.push_back(std::move(item));
                         }
+                    } else if (info_only && line.starts_with("ENTRY ")) {
+                        // "ENTRY <index> <seconds> <url> <title>": only the title may contain spaces.
+                        size_t a = line.find(' ', 6);
+                        size_t b = a == std::string::npos ? a : line.find(' ', a + 1);
+                        size_t c = b == std::string::npos ? b : line.find(' ', b + 1);
+                        if (c != std::string::npos) {
+                            PlaylistItem item;
+                            item.index = std::atoi(line.substr(6, a - 6).c_str());
+                            item.seconds = std::atoi(line.substr(a + 1, b - a - 1).c_str());
+                            item.source = line.substr(b + 1, c - b - 1);
+                            item.title = line.substr(c + 1);
+                            if (item.title == "[Private video]" || item.title == "[Deleted video]") ++skipped;
+                            else result.items.push_back(std::move(item));
+                        }
+                    } else if (info_only && line.starts_with("NAME ")) {
+                        result.title = line.substr(5);
+                    } else if (info_only && line.starts_with("ARTIST ")) {
+                        result.artist = line.substr(7);
+                    } else if (info_only && line.starts_with("ALBUM ")) {
+                        result.album = line.substr(6);
+                    } else if (info_only && line.starts_with("SECONDS ")) {
+                        result.seconds = std::atoi(line.c_str() + 8);
                     } else if (line.starts_with("TITLE ")) {
                         if (result.playlist_title.empty()) result.playlist_title = line.substr(6);
                     } else if (line.starts_with("UPLOADER ")) {
@@ -156,20 +226,24 @@ void Downloader::run(std::string url, fs::path out_dir, std::string format, bool
             int status = 0;
             waitpid(pid, &status, 0);
             pid_ = -1;
-            if (playlist) {
+            for (std::string* s : {&result.artist, &result.album})
+                if (*s == "NA") s->clear();
+            if (info_only && !playlist) {
+                result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 && !result.title.empty();
+            } else if (playlist) {
                 // Some videos failing doesn't fail the playlist; none making it does.
                 for (std::string* s : {&result.playlist_title, &result.uploader})
                     if (*s == "NA") s->clear();
                 std::stable_sort(result.items.begin(), result.items.end(),
                                  [](const PlaylistItem& a, const PlaylistItem& b) { return a.index < b.index; });
                 int n = static_cast<int>(result.items.size());
-                result.failed = std::max(errors, item_count_ > n ? item_count_ - n : 0);
+                result.failed = info_only ? skipped + errors : std::max(errors, item_count_ > n ? item_count_ - n : 0);
                 result.ok = n > 0;
             } else {
                 result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
                             !result.file.empty() && fs::exists(result.file);
             }
-            if (!result.ok) result.error = last_line.empty() ? "download failed" : last_line;
+            if (!result.ok) result.error = last_line.empty() ? (info_only ? "couldn't read that link" : "download failed") : last_line;
         }
         close(pipe_fds[0]);
     }

@@ -115,6 +115,10 @@ struct TagForm {
     int pick = -1;           // highlighted suggestion; -1 = use what's typed
     std::string source;      // URL it was downloaded from
     bool podcast = false;    // the Podcast toggle; ap starts it on
+    // aS / aA / aP: nothing was downloaded. Saving only lists the song(s) in
+    // library.tsv, as not downloaded here (⇣); `file` is empty.
+    bool listing = false;
+    int seconds = 0;         // a listed song's length, 0 if unknown
 
     // A downloaded playlist, saved as one album: Title isn't asked (each
     // song's comes from its video), only Artist and Album.
@@ -296,6 +300,7 @@ struct App {
     std::string restoring;                   // the one downloading now, "" if none
     std::string last_url;                    // what was typed in the `a` prompt
     AddKind add_kind = AddKind::Song;        // which of as / aa / ap opened it
+    bool add_listing = false;                // aS / aA / aP: list it without downloading
     std::set<std::string> pending_podcasts;  // new files to mark as podcasts, until the next load()
 
     // --- playback ---
@@ -1594,12 +1599,14 @@ struct App {
     // =================================================================
 
     // as / aa / ap: ask for a URL, pre-filled from the clipboard.
-    void begin_add(AddKind kind) {
+    // aS / aA / aP (`listing`): the same, but only list it, without downloading.
+    void begin_add(AddKind kind, bool listing = false) {
         if (downloader.busy() || !restoring.empty()) {
             message = "A download is already running";
             return;
         }
         add_kind = kind;
+        add_listing = listing;
         mode = Mode::Url;
         input = clipboard_url();
     }
@@ -1610,6 +1617,11 @@ struct App {
         last_url = url;
         if (add_kind == AddKind::Album) {
             if (playlist_id(url).empty()) { message = "That isn't a playlist link (as adds a single song)"; return; }
+            if (add_listing) {
+                downloader.lookup(url, true);
+                message = "Reading the playlist…";
+                return;
+            }
             downloader.start(url, incoming_dir(), "best", true);
             message = "Downloading playlist…";
             return;
@@ -1617,6 +1629,11 @@ struct App {
         // A song or podcast is one video: a link to just a playlist has none.
         if (!playlist_id(url).empty() && !names_video(url)) {
             message = "That's a playlist link: aa adds it as an album";
+            return;
+        }
+        if (add_listing) {
+            downloader.lookup(url);
+            message = "Reading the link…";
             return;
         }
         if (add_kind == AddKind::Podcast) {
@@ -1639,13 +1656,22 @@ struct App {
         pump_restores();
         if (!result) return;
         if (!result->ok) {
-            message = "Download failed: " + result->error;
+            message = (result->info_only ? "Couldn't read the link: " : "Download failed: ") + result->error;
             return;
         }
         if (result->playlist) return begin_album(*result);
 
         // Pre-fill from the tags yt-dlp wrote, e.g. title "Tool - Schism (Official Video)".
-        Track t = read_track(result->file);
+        // A listing has no file: the same details come straight from yt-dlp.
+        Track t;
+        if (result->info_only) {
+            t.title = result->title;
+            t.artist = result->artist.empty() ? "Unknown Artist" : result->artist;
+            t.album = result->album;
+            t.seconds = result->seconds;
+        } else {
+            t = read_track(result->file);
+        }
         bool podcast = add_kind == AddKind::Podcast;
         std::string channel = t.artist != "Unknown Artist" ? clean_channel(t.artist) : "";
         // A podcast's title isn't "Artist - Song" ("AMA - Nov 2026"), so don't
@@ -1656,6 +1682,8 @@ struct App {
         form = {};
         form.file = result->file;
         form.is_new = true;
+        form.listing = result->info_only;
+        form.seconds = t.seconds;
         form.source = result->source.empty() ? last_url : result->source;
         form.podcast = podcast;
         form.fields[TagForm::Title] = guess.title;
@@ -1673,6 +1701,7 @@ struct App {
         form.source = last_url;
         form.batch = result.items;
         form.failed = result.failed;
+        form.listing = result.info_only;
 
         // The artist: what most video titles start with ("Tool - Schism"),
         // else the playlist's channel ("Tool - Topic"), else the first song's tag.
@@ -1680,7 +1709,9 @@ struct App {
         std::string artist, first_tag;
         int best = 0;
         for (const PlaylistItem& item : form.batch) {
-            Track t = read_track(item.file);
+            Track t;
+            if (form.listing) t.title = item.title;  // no file to read; the channel comes from `uploader`
+            else t = read_track(item.file);
             form.video_titles.push_back(t.title);
             if (first_tag.empty() && t.artist != "Unknown Artist") first_tag = clean_channel(t.artist);
             std::string guessed = guess_from_title(t.title).artist;
@@ -1867,6 +1898,25 @@ struct App {
             return;
         }
         mode = Mode::Normal;
+        if (form.listing) {
+            Track t;
+            t.path = listing_path(folder_for(artist, album), title, {});
+            t.title = title;
+            t.artist = artist.empty() ? "Unknown Artist" : artist;
+            t.album = album;
+            t.seconds = form.seconds;
+            t.source = form.source;
+            t.podcast = form.podcast;
+            t.missing = true;
+            fs::path where = t.path;
+            tracks.push_back(std::move(t));
+            save_manifest();
+            load();
+            select_path(where);
+            message = "Listed (not downloaded): " + title + (artist.empty() ? "" : " — " + artist) +
+                      " · Enter or :sync downloads it";
+            return;
+        }
         if (!write_tags(form.file, title, artist, album)) {
             message = "Couldn't write tags to " + form.file.filename().string();
             return;
@@ -1896,12 +1946,63 @@ struct App {
         message = "Saved: " + title + (artist.empty() ? "" : " — " + artist);
     }
 
+    // ~/Music/Artist/Album, where a new song is filed.
+    fs::path folder_for(const std::string& artist, const std::string& album) const {
+        fs::path folder = dir / safe_filename(artist.empty() ? "Unknown Artist" : artist);
+        if (!album.empty()) folder /= safe_filename(album);
+        return folder;
+    }
+
+    // Where a listed (not downloaded) song would go once downloaded: like
+    // free_path, but also skipping paths library.tsv already lists, and
+    // those in `taken` (others of the same batch). Opus is what YouTube
+    // usually has, and a different format just changes the extension later.
+    fs::path listing_path(const fs::path& folder, const std::string& title, const std::set<fs::path>& taken) const {
+        std::string name = safe_filename(title), ext = ".opus";
+        auto used = [&](const fs::path& p) { return fs::exists(p) || track_index.count(p.string()) || taken.count(p); };
+        fs::path p = folder / (name + ext);
+        for (int i = 2; used(p); ++i) p = folder / (name + " (" + std::to_string(i) + ")" + ext);
+        return p;
+    }
+
+    // aA: list every song of the playlist as not downloaded (⇣).
+    void save_album_listing() {
+        const std::string& artist = form.fields[TagForm::Artist];
+        const std::string& album = form.fields[TagForm::Album];
+        fs::path folder = folder_for(artist, album);
+        std::set<fs::path> taken;
+        for (size_t i = 0; i < form.batch.size(); ++i) {
+            const PlaylistItem& item = form.batch[i];
+            Track t;
+            std::string title = album_song_title(form.video_titles[i], artist);
+            t.path = listing_path(folder, title, taken);
+            taken.insert(t.path);
+            t.title = title;
+            t.artist = artist.empty() ? "Unknown Artist" : artist;
+            t.album = album;
+            t.number = item.index;
+            t.seconds = item.seconds;
+            t.source = item.source;
+            t.missing = true;
+            tracks.push_back(std::move(t));
+        }
+        save_manifest();
+        load();
+        // Select the album's first song (tracks are sorted by track number).
+        for (const Track& t : tracks) {
+            if (taken.count(t.path)) { select_path(t.path); break; }
+        }
+        message = "Listed " + plural(form.batch.size(), "song") + " in " + (album.empty() ? "no album" : album) +
+                  (artist.empty() ? "" : " — " + artist) + " (not downloaded) · :sync album downloads them";
+        if (form.failed) message += " · " + std::to_string(form.failed) + " unavailable on YouTube";
+    }
+
     void save_album() {
         const std::string& artist = form.fields[TagForm::Artist];
         const std::string& album = form.fields[TagForm::Album];
         mode = Mode::Normal;
-        fs::path folder = dir / safe_filename(artist.empty() ? "Unknown Artist" : artist);
-        if (!album.empty()) folder /= safe_filename(album);
+        if (form.listing) return save_album_listing();
+        fs::path folder = folder_for(artist, album);
 
         int saved = 0, problems = 0;
         fs::path first;
@@ -1932,6 +2033,10 @@ struct App {
         mode = Mode::Normal;
         if (!form.is_new) {
             message = "Edit cancelled";
+            return;
+        }
+        if (form.listing) {  // nothing was downloaded, so nothing to keep
+            message = "Not added";
             return;
         }
         if (!form.batch.empty()) {  // keep the whole playlist, untagged, in Unsorted/
@@ -2294,7 +2399,10 @@ struct App {
                 if (c == "s") begin_add(AddKind::Song);
                 else if (c == "a") begin_add(AddKind::Album);
                 else if (c == "p") begin_add(AddKind::Podcast);
-                else message = "Add: as = song · aa = album (playlist) · ap = podcast";
+                else if (c == "S") begin_add(AddKind::Song, true);
+                else if (c == "A") begin_add(AddKind::Album, true);
+                else if (c == "P") begin_add(AddKind::Podcast, true);
+                else message = "Add: as = song · aa = album · ap = podcast · capital (aS aA aP) = list without downloading";
             }
             if (first == 'd' && c == "a") delete_artist_here();
             return true;
@@ -2603,9 +2711,10 @@ struct App {
             rest = hbox({text(" New " + rename_subject() + " name: "), text(input + "▏"),
                          text("   Enter save · Esc cancel") | dim});
         } else if (mode == Mode::Url) {
-            mode_tag = tag(add_kind == AddKind::Album ? "ADD ALBUM" : add_kind == AddKind::Podcast ? "ADD PODCAST" : "ADD SONG",
-                           Color::Cyan);
-            rest = hbox({text(" URL: "), text(input + "▏"), text("   Enter download · Esc cancel") | dim});
+            std::string what = add_kind == AddKind::Album ? "ALBUM" : add_kind == AddKind::Podcast ? "PODCAST" : "SONG";
+            mode_tag = tag((add_listing ? "LIST " : "ADD ") + what, Color::Cyan);
+            rest = hbox({text(" URL: "), text(input + "▏"),
+                         text(add_listing ? "   Enter list it (no download) · Esc cancel" : "   Enter download · Esc cancel") | dim});
         } else if (mode == Mode::Tag || mode == Mode::Pick) {
             mode_tag = tag(mode == Mode::Tag ? "TAG" : "PLAYLIST", Color::Blue);
             rest = text(" " + message);
@@ -2771,6 +2880,7 @@ struct App {
             line("as / aa / ap", "add a song / an album (playlist) / a podcast from a URL"),
             line("e", "edit tags (or rename the artist / album)"),
             line("", "a playlist URL adds the whole playlist as an album"),
+            line("aS / aA / aP", "same, but only list it (⇣), without downloading"),
             line("dd", "delete song (or the album / artist pane's selection)"),
             line("dr / da", "delete the album (albums pane) / artist (artists pane)"),
             line("", "asks: y/Enter = downloads only, a = also forget it, n = cancel"),

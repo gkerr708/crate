@@ -261,6 +261,8 @@ std::string lower_ascii(std::string s) {
     return s;
 }
 
+int roman_or_word(const std::string& w);
+
 // "Another Brick in the Wall, Pt. 1" -> "another brick in the wall part 1".
 // With `strip`, also drops (…) / […] and a " - 2011 Remaster" style tail.
 std::string normalize(const std::string& title, bool strip) {
@@ -278,10 +280,15 @@ std::string normalize(const std::string& title, bool strip) {
     }
     std::vector<std::string> words;
     std::string word;
+    // Numbers after "part" are written every way: Pts. 1-5, Parts I–V, Part One.
+    bool numbering = false;
     auto flush = [&] {
         if (word.empty()) return;
-        if (word == "pt") word = "part";
-        if (word == "pts") word = "parts";
+        if (word == "pt" || word == "pts" || word == "parts") word = "part";
+        if (numbering) {
+            if (int n = roman_or_word(word)) word = std::to_string(n);
+        }
+        numbering = word == "part" || (numbering && std::isdigit(static_cast<unsigned char>(word[0])));
         words.push_back(std::move(word));
         word.clear();
     };
@@ -290,6 +297,7 @@ std::string normalize(const std::string& title, bool strip) {
         if (c == '&') { flush(); words.push_back("and"); }
         else if (c == 0xC3 && i + 1 < s.size() && (s[i + 1] == '\xA6' || s[i + 1] == '\x86')) { word += "ae"; ++i; }
         else if (c == 0xE2 && i + 2 < s.size() && s[i + 1] == '\x80' && (s[i + 2] == '\x98' || s[i + 2] == '\x99')) i += 2;  // ’
+        else if (c == 0xE2 && i + 2 < s.size() && s[i + 1] == '\x80') { flush(); i += 2; }  // – — • and friends
         else if (c == '\'') {}  // "Don't" and "Dont" are the same word
         else if (std::isalnum(c) || c >= 0x80) word += static_cast<char>(std::tolower(c));
         else flush();
@@ -298,6 +306,40 @@ std::string normalize(const std::string& title, bool strip) {
     std::string out;
     for (const std::string& w : words) out += (out.empty() ? "" : " ") + w;
     return out;
+}
+
+// "iv" -> 4, "two" -> 2; 0 if it's neither.
+int roman_or_word(const std::string& w) {
+    static const char* names[] = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"};
+    for (int i = 0; i < 10; ++i)
+        if (w == names[i]) return i + 1;
+    if (w.empty() || w.find_first_not_of("ivx") != std::string::npos) return 0;
+    int total = 0;
+    for (size_t i = 0; i < w.size(); ++i) {
+        int v = w[i] == 'i' ? 1 : w[i] == 'v' ? 5 : 10;
+        int next = i + 1 < w.size() ? (w[i + 1] == 'i' ? 1 : w[i + 1] == 'v' ? 5 : 10) : 0;
+        total += v < next ? -v : v;
+    }
+    return total;
+}
+
+// How many words two normalized titles share.
+int shared_words(const std::string& a, const std::string& b) {
+    auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i)
+            if (i == s.size() || s[i] == ' ') {
+                if (i > start) out.push_back(s.substr(start, i - start));
+                start = i + 1;
+            }
+        return out;
+    };
+    std::vector<std::string> x = split(a), y = split(b);
+    int n = 0;
+    for (const std::string& w : x)
+        if (std::find(y.begin(), y.end(), w) != y.end()) ++n;
+    return n;
 }
 
 // Whether `small` appears in `big` as whole words.
@@ -317,9 +359,38 @@ std::vector<int> match_tracks(const std::vector<std::string>& songs, const std::
     std::vector<int> numbers(songs.size(), 0);
     std::vector<bool> used(album.size(), false);
 
+    // Go through the songs in title order, numbers compared as numbers, so
+    // when two could be either track ("Pts. 1-5" and "Pts. 6-9" against
+    // "Part One" and "Part Two") they take them in that order.
+    std::vector<size_t> by_title(songs.size());
+    for (size_t i = 0; i < songs.size(); ++i) by_title[i] = i;
+    auto natural_less = [](const std::string& x, const std::string& y) {
+        size_t i = 0, j = 0;
+        while (i < x.size() && j < y.size()) {
+            if (std::isdigit(static_cast<unsigned char>(x[i])) && std::isdigit(static_cast<unsigned char>(y[j]))) {
+                size_t i2 = i, j2 = j;
+                while (i2 < x.size() && std::isdigit(static_cast<unsigned char>(x[i2]))) ++i2;
+                while (j2 < y.size() && std::isdigit(static_cast<unsigned char>(y[j2]))) ++j2;
+                long a = std::atol(x.substr(i, i2 - i).c_str()), b = std::atol(y.substr(j, j2 - j).c_str());
+                if (a != b) return a < b;
+                i = i2;
+                j = j2;
+            } else {
+                if (x[i] != y[j]) return x[i] < y[j];
+                ++i;
+                ++j;
+            }
+        }
+        return x.size() - i < y.size() - j;
+    };
+    std::vector<std::string> keys;
+    for (const std::string& t : songs) keys.push_back(normalize(t, false));
+    std::stable_sort(by_title.begin(), by_title.end(),
+                     [&](size_t a, size_t b) { return natural_less(keys[a], keys[b]); });
+
     // Strictest first, so "In the Flesh?" and "In the Flesh" each find their own.
     auto pass = [&](auto key) {
-        for (size_t s = 0; s < songs.size(); ++s) {
+        for (size_t s : by_title) {
             if (numbers[s]) continue;
             std::string want = key(songs[s]);
             if (want.empty()) continue;
@@ -337,17 +408,21 @@ std::vector<int> match_tracks(const std::vector<std::string>& songs, const std::
     pass([](const std::string& x) { return normalize(x, true); });
 
     // Last, one inside the other: "Schism (Official Video)" -> "Schism".
-    // The longest (most specific) track title wins.
-    for (size_t s = 0; s < songs.size(); ++s) {
+    // If several fit ("Shine On..., Parts I–V" and "..., Parts VI–IX"), the
+    // one sharing the most words wins, then the earlier one.
+    for (size_t s : by_title) {
         if (numbers[s]) continue;
         std::string a = normalize(songs[s], false), a_strip = normalize(songs[s], true);
-        size_t best = album.size(), best_len = 0;
+        size_t best = album.size();
+        int best_shared = -1;
         for (size_t t = 0; t < album.size(); ++t) {
             if (used[t]) continue;
             std::string b = normalize(album[t], true);
-            if ((contains_words(a, b) || contains_words(b, a_strip)) && b.size() > best_len) {
+            if (!contains_words(a, b) && !contains_words(b, a_strip)) continue;
+            int shared = shared_words(a, normalize(album[t], false));
+            if (shared > best_shared) {
                 best = t;
-                best_len = b.size();
+                best_shared = shared;
             }
         }
         if (best < album.size()) {
@@ -444,6 +519,13 @@ void AlbumLookup::run(std::string artist, std::string album, std::vector<std::st
             if (!year.empty()) order.release += " (" + year + ")";
         }
         if (matched == titles.size() && list.size() == titles.size()) break;  // can't do better
+    }
+    // A release with only a few of the songs (one episode of a series,
+    // a single) is the wrong thing: leave the order alone.
+    if (order.ok && best_matched * 2 < titles.size()) {
+        order.ok = false;
+        order.error = "only " + std::to_string(best_matched) + " of the " + std::to_string(titles.size()) +
+                      " songs are on " + order.release;
     }
     if (!order.ok && order.error.empty())
         order.error = candidates.empty() ? "couldn't find it on MusicBrainz" : "none of the songs are on it";

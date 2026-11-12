@@ -882,19 +882,62 @@ struct App {
         message = "Put " + plural(yanked.size(), "song") + " into " + pl->name;
     }
 
-    // J / K: swap the song with its neighbour.
+    // J / K: swap the song with its neighbour, in a playlist or an album.
     void move_song(int delta) {
         Playlist* pl = current_playlist();
-        if (!pl) {
-            message = "J / K reorder songs inside a playlist";
-            return;
-        }
+        if (!pl) return move_in_album(delta);
         int other = song_cur.sel + delta;
         if (songs.empty() || other < 0 || other >= static_cast<int>(songs.size())) return;
         std::swap(pl->songs[slots[song_cur.sel]], pl->songs[slots[other]]);
         save(*pl);
         refresh_songs();
         song_cur.sel = other;
+    }
+
+    // J / K in an album: swap the song with its neighbour and renumber the
+    // whole album 1, 2, 3... in the new order (tags and library.tsv).
+    void move_in_album(int delta) {
+        if (groups.empty() || groups[group_cur.sel].kind != Group::Album) {
+            message = "J / K reorder songs inside an album or a playlist";
+            return;
+        }
+        if (!filter.empty()) { message = "Clear the search first (Esc), then J / K"; return; }
+        int other = song_cur.sel + delta;
+        if (songs.empty() || other < 0 || other >= static_cast<int>(songs.size())) return;
+
+        std::vector<int> order = songs;
+        std::swap(order[song_cur.sel], order[other]);
+        std::string moved = tracks[order[other]].path.string();
+        int failed = 0;
+        for (int n = 1; n <= static_cast<int>(order.size()); ++n) {
+            Track& t = tracks[order[n - 1]];
+            if (t.number == n) continue;
+            t.number = n;
+            if (!t.missing && !write_tags(t.path, t.title, t.artist == "Unknown Artist" ? "" : t.artist, t.album, n))
+                ++failed;
+        }
+        resort_tracks();
+        save_manifest();
+        refresh_songs();
+        if (auto it = track_index.find(moved); it != track_index.end()) song_cur.sel = std::max(0, index_of(songs, it->second));
+        if (failed) message = std::to_string(failed) + " couldn't be retagged";
+    }
+
+    // Sort `tracks` again after numbers changed, keeping everything that
+    // points into it (what's playing, the queue) on the same songs.
+    void resort_tracks() {
+        std::string playing_path = playing >= 0 ? tracks[playing].path.string() : "";
+        std::vector<std::string> queue_paths;
+        for (int i : queue) queue_paths.push_back(tracks[i].path.string());
+        sort_tracks(tracks);
+        track_index.clear();
+        for (int i = 0; i < static_cast<int>(tracks.size()); ++i) track_index[tracks[i].path.string()] = i;
+        auto find = [&](const std::string& path) {
+            auto it = track_index.find(path);
+            return it == track_index.end() ? -1 : it->second;
+        };
+        playing = playing_path.empty() ? -1 : find(playing_path);
+        for (size_t i = 0; i < queue.size(); ++i) queue[i] = find(queue_paths[i]);
     }
 
     // A: choose a playlist to add the selected songs to.
@@ -2688,7 +2731,7 @@ struct App {
             line("A", "add song(s) to a playlist"),
             line("yy / dd / p / P", "yank / remove from playlist / paste"),
             line("V", "select lines, then y, d or A"),
-            line("J / K", "move song down / up"),
+            line("J / K", "move song down / up (in an album, renumbers it)"),
             line(":new :rename", ":new Name  :rename Name  :delete"),
             heading("Other computers  (⇣ = not downloaded here)"),
             line("Enter on ⇣", "download that song"),

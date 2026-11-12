@@ -280,6 +280,7 @@ struct App {
 
     // --- playlist editing ---
     std::vector<fs::path> yanked;   // songs copied with yy / dd, pasted with p
+    std::vector<fs::path> cut;      // songs cut with x in an album, put back with p / P
     std::vector<fs::path> picking;  // songs being added with A
     int pick = -1;                  // highlighted playlist in the A picker
     std::string confirm_text;       // question asked in Confirm mode (y/n)
@@ -863,6 +864,7 @@ struct App {
 
     void put(bool before) {
         Playlist* pl = current_playlist();
+        if (!pl && !cut.empty()) return put_cut(before);
         if (!pl) {
             message = "Open a playlist to paste into it (or press A to add to one)";
             return;
@@ -907,7 +909,55 @@ struct App {
 
         std::vector<int> order = songs;
         std::swap(order[song_cur.sel], order[other]);
-        std::string moved = tracks[order[other]].path.string();
+        renumber_album(order, tracks[order[other]].path.string());
+    }
+
+    // True (with a message if not) when the songs pane shows a whole album
+    // that can be reordered.
+    bool album_reorderable() {
+        if (groups.empty() || groups[group_cur.sel].kind != Group::Album) {
+            message = "Open an album or a playlist to reorder it";
+            return false;
+        }
+        if (!filter.empty()) { message = "Clear the search first (Esc)"; return false; }
+        return !songs.empty();
+    }
+
+    // x in an album: remember the selected songs, to put back elsewhere with p / P.
+    void cut_rows(int n) {
+        if (songs.empty()) return;
+        if (current_playlist()) return delete_rows(n);  // a playlist already does this with dd
+        if (!album_reorderable()) return;
+        cut = paths_in(row_range(n));
+        visual = -1;
+        message = "Cut " + plural(cut.size(), "song") + " — p / P puts it after / before the selected song";
+    }
+
+    // p / P in an album: move the cut songs after / before the selected one.
+    void put_cut(bool before) {
+        if (!album_reorderable()) return;
+        std::set<std::string> moving;
+        for (const fs::path& p : cut) moving.insert(p.string());
+        std::vector<int> rest, cut_rows;
+        int at = -1;
+        for (int i = 0; i < static_cast<int>(songs.size()); ++i) {
+            bool is_cut = moving.count(tracks[songs[i]].path.string());
+            if (i == song_cur.sel) at = static_cast<int>(rest.size()) + (before || is_cut ? 0 : 1);
+            (is_cut ? cut_rows : rest).push_back(songs[i]);
+        }
+        if (cut_rows.empty()) { message = "The cut songs aren't in this album"; return; }
+        if (cut_rows.size() != cut.size()) { message = "x / p move songs within one album"; return; }
+        std::vector<int> order = rest;
+        order.insert(order.begin() + at, cut_rows.begin(), cut_rows.end());
+        renumber_album(order, tracks[cut_rows[0]].path.string());
+        cut.clear();
+        message = "Moved " + plural(cut_rows.size(), "song");
+    }
+
+    // Number an album's songs 1, 2, 3... in `order` (indices into tracks),
+    // in their tags and library.tsv, and keep the cursor on `keep`.
+    void renumber_album(const std::vector<int>& order, const std::string& keep) {
+        std::string moved = keep;
         int failed = 0;
         for (int n = 1; n <= static_cast<int>(order.size()); ++n) {
             Track& t = tracks[order[n - 1]];
@@ -2300,6 +2350,7 @@ struct App {
         else if (c == "V") songs_only([&] { visual = (visual >= 0 || songs.empty()) ? -1 : song_cur.sel; });
         else if (c == "y") songs_only([&] { visual >= 0 ? yank(1) : start_pending('y'); });
         else if (c == "d") { visual >= 0 ? delete_rows(1) : start_pending('d'); }
+        else if (c == "x") songs_only([&] { cut_rows(1); });
         else if (c == "p") songs_only([&] { put(false); });
         else if (c == "P") songs_only([&] { put(true); });
         else if (c == "A") songs_only([&] { begin_pick(n); });
@@ -2732,6 +2783,7 @@ struct App {
             line("yy / dd / p / P", "yank / remove from playlist / paste"),
             line("V", "select lines, then y, d or A"),
             line("J / K", "move song down / up (in an album, renumbers it)"),
+            line("x then p / P", "cut a song, put it after / before another (album)"),
             line(":new :rename", ":new Name  :rename Name  :delete"),
             heading("Other computers  (⇣ = not downloaded here)"),
             line("Enter on ⇣", "download that song"),

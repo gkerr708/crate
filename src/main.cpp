@@ -34,6 +34,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stop_token>
 #include <set>
@@ -51,6 +52,7 @@
 #include "download.hpp"
 #include "library.hpp"
 #include "manifest.hpp"
+#include "musicbrainz.hpp"
 #include "player.hpp"
 #include "progress.hpp"
 #include "playlist.hpp"
@@ -329,6 +331,11 @@ struct App {
     int shrink_done = 0, shrink_failed = 0;
     std::uintmax_t shrink_saved = 0;  // bytes
     std::string shrink_error;
+
+    // --- :order ---
+    AlbumLookup album_lookup{[this] { screen.PostEvent(Event::Custom); }};
+    std::vector<std::string> order_paths;  // the album's songs, as sent to the lookup
+    std::string order_album;
     SpectrumBars mini_bars, big_bars;
     bool show_vis = true, show_big = false, show_now = true;
     int vis_rows = 0;  // mini spectrum rows shown last draw, 0 = hidden
@@ -1181,6 +1188,69 @@ struct App {
         message = "Shrinking " + what + " (" + plural(shrinker.count(), "file") + ") to 48 kbps" + notes;
     }
 
+    // :order: look the selected album up on MusicBrainz and number its songs
+    // the way the album has them (otherwise unnumbered songs sort by title).
+    void order_album_tracks() {
+        if (album_lookup.busy()) { message = "Already looking up " + order_album; return; }
+        std::string artist, album;
+        if (pane == Pane::Songs && !songs.empty()) {
+            const Track& t = tracks[songs[song_cur.sel]];
+            artist = t.artist;
+            album = t.album;
+        } else if (pane == Pane::Albums && !groups.empty() && groups[group_cur.sel].kind == Group::Album) {
+            artist = groups[group_cur.sel].artist;
+            album = groups[group_cur.sel].album;
+        } else {
+            message = "Select an album first";
+            return;
+        }
+        if (album.empty()) { message = "That song isn't on an album"; return; }
+        if (artist == "Unknown Artist") { message = "Set the album's artist first (e on the artist)"; return; }
+
+        std::vector<std::string> titles;
+        order_paths.clear();
+        for (const Track& t : tracks) {
+            if (lower(t.artist) != lower(artist) || lower(t.album) != lower(album)) continue;
+            titles.push_back(t.title);
+            order_paths.push_back(t.path.string());
+        }
+        order_album = album;
+        album_lookup.start(artist, album, std::move(titles));
+        message = "Looking up " + album + " — " + artist + " on MusicBrainz…";
+    }
+
+    // Called on every event: numbers the album once the lookup is back.
+    void check_order() {
+        if (mode != Mode::Normal) return;  // wait until the user isn't typing
+        std::optional<AlbumOrder> result = album_lookup.take_result();
+        if (!result) return;
+        if (!result->ok) { message = "Couldn't order " + order_album + ": " + result->error; return; }
+
+        // Songs that aren't on the album go after the ones that are.
+        int next = *std::max_element(result->numbers.begin(), result->numbers.end()) + 1;
+        int matched = 0, failed = 0;
+        std::string selected = pane == Pane::Songs && !songs.empty() ? tracks[songs[song_cur.sel]].path.string() : "";
+        for (size_t i = 0; i < order_paths.size(); ++i) {
+            auto it = track_index.find(order_paths[i]);
+            if (it == track_index.end()) continue;  // gone since the lookup started
+            Track& t = tracks[it->second];
+            int n = result->numbers[i];
+            if (n > 0) ++matched;
+            else n = next++;
+            if (n == t.number) continue;
+            t.number = n;
+            if (!t.missing && !write_tags(t.path, t.title, t.artist == "Unknown Artist" ? "" : t.artist, t.album, n))
+                ++failed;
+        }
+        save_manifest();  // numbers for songs not on this computer live here
+        load();
+        if (!selected.empty()) select_path(selected);
+        int total = static_cast<int>(order_paths.size());
+        message = "Ordered " + order_album + " like " + result->release;
+        if (matched < total) message += " · " + std::to_string(total - matched) + " not on it, put at the end";
+        if (failed) message += " · " + std::to_string(failed) + " couldn't be tagged";
+    }
+
     // Called on every event: swaps finished files into the library.
     void check_shrink() {
         if (mode != Mode::Normal) return;  // wait until the user isn't typing
@@ -1902,6 +1972,7 @@ struct App {
         else if (verb == "sync") sync(arg);
         else if (verb == "podcast") mark_podcast(arg);
         else if (verb == "shrink") shrink();
+        else if (verb == "order") order_album_tracks();
         else if (verb == "source") set_source(arg);
         else if (verb == "forget") forget_song();
         else if (!verb.empty() && std::all_of(verb.begin(), verb.end(), ::isdigit)) {
@@ -1980,6 +2051,7 @@ struct App {
         bool handled = handle_event(e);
         check_download();  // after the key too, in case it just closed a prompt
         check_shrink();
+        check_order();
         return handled;
     }
 
@@ -2622,6 +2694,7 @@ struct App {
             line(":sync artist", "download the selected artist's missing songs"),
             line(":podcast [on|off]", "mark the selected song / album / artist as a podcast"),
             line(":shrink", "re-encode the selected song / album / artist to 48 kbps"),
+            line(":order", "number the selected album's songs in album order (MusicBrainz)"),
             line(":source URL", "set where the song can be downloaded"),
             line(":forget", "remove a missing song from the list"),
         });

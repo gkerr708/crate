@@ -52,3 +52,12 @@ ln -s ~/Projects/crate/build/crate ~/.local/bin/crate
 The order is `ln -s TARGET LINK_NAME`: the real file comes first, then the link to create. The link points at `build/crate`, so every rebuild is picked up automatically, with no copying. If you delete `build/`, the link breaks until you build again.
 
 Check it with `ls -l ~/.local/bin/crate`, and remove it with `rm ~/.local/bin/crate`.
+
+## Keeping the music repo in sync
+
+If the library folder is itself a git repo with a remote (it only tracks `library.tsv`, `progress.tsv` and playlists), crate checks it for you:
+
+- On launch it fetches, and if the remote has new commits it lists them and asks `Pull them now? [Y/n]`.
+- After you quit it checks for uncommitted changes or unpushed commits and asks `Commit and push them now? [Y/n]`.
+
+Both prompts appear in the terminal outside the UI. They are skipped when the folder isn't a repo, has no upstream, or there's no terminal. If the remote can't be reached, crate carries on offline.

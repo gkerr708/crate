@@ -57,6 +57,7 @@
 #include "progress.hpp"
 #include "playlist.hpp"
 #include "shrink.hpp"
+#include "sync.hpp"
 #include "visualizer.hpp"
 
 using namespace ftxui;
@@ -2990,6 +2991,8 @@ int main(int argc, char** argv) {
     // A full, clean path, so song paths always look the same (playlists match them).
     dir = fs::weakly_canonical(fs::absolute(dir));
 
+    sync_on_start(dir);
+
     auto screen = ScreenInteractive::Fullscreen();
     // The player and downloader call this from their own threads; PostEvent
     // is thread-safe and makes FTXUI wake up and redraw.
@@ -3007,4 +3010,5 @@ int main(int argc, char** argv) {
     ui |= CatchEvent([&](Event e) { return app.on_event(e); });
     screen.Loop(ui);
     app.shutdown();
+    sync_on_exit(dir);
 }

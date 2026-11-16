@@ -1,14 +1,28 @@
 // Keeps the library folder's git repo (library.tsv, progress.tsv, playlists)
-// in step with its remote. Both checks talk to the terminal directly, so
-// they run before the UI starts and after it exits. If the folder isn't a
-// git repo with a remote, or there's no terminal, they do nothing.
+// in step with its remote. The functions that return a SyncResult are safe
+// to call from a background thread. If the folder isn't its own git repo
+// with a remote, they report that and do nothing.
 #pragma once
 
 #include <filesystem>
+#include <string>
 
-// Fetches, and if the remote has new commits asks whether to pull them.
-void sync_on_start(const std::filesystem::path& library);
+struct SyncResult {
+    bool ok = true;     // false: something went wrong, `text` says what
+    bool repo = true;   // false: not a git repo with a remote, nothing was done
+    int behind = 0;     // commits on the remote we don't have (from sync_check)
+    std::string text;   // a message fit for the status bar
+};
 
-// If there are uncommitted changes or unpushed commits, asks whether to
-// commit and push them.
+// Fetches and reports how many commits the remote has that we don't.
+SyncResult sync_check(const std::filesystem::path& library);
+
+// Pulls the remote's commits (keeping uncommitted edits).
+SyncResult sync_pull(const std::filesystem::path& library);
+
+// Commits whatever changed in the repo and pushes it.
+SyncResult sync_push(const std::filesystem::path& library);
+
+// After the UI has closed: if there are uncommitted changes or unpushed
+// commits, asks in the terminal whether to commit and push them.
 void sync_on_exit(const std::filesystem::path& library);

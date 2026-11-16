@@ -24,6 +24,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -707,8 +708,73 @@ struct App {
         next();
     }
 
+    // --- music repo (git), kept off the UI thread ---
+    std::thread repo_thread;
+    std::atomic<bool> repo_busy{false};
+    std::mutex repo_mu;
+    std::function<void()> repo_done;  // what to do on the UI thread when the work finishes
+
+    // Runs `work` in the background; the function it returns runs on the UI thread.
+    void run_repo(std::function<std::function<void()>()> work) {
+        if (repo_busy) {
+            message = "Still busy with the music repo";
+            return;
+        }
+        if (repo_thread.joinable()) repo_thread.join();
+        repo_busy = true;
+        repo_thread = std::thread([this, work = std::move(work)] {
+            auto done = work();
+            {
+                std::lock_guard<std::mutex> lock(repo_mu);
+                repo_done = std::move(done);
+            }
+            repo_busy = false;
+            screen.PostEvent(Event::Custom);
+        });
+    }
+
+    void check_repo() {
+        if (mode != Mode::Normal) return;  // wait until the user isn't typing
+        std::function<void()> done;
+        {
+            std::lock_guard<std::mutex> lock(repo_mu);
+            done.swap(repo_done);
+        }
+        if (done) done();
+    }
+
+    // On launch: fetch, and say in the status bar if the remote has news.
+    void start_repo_check() {
+        run_repo([this] {
+            SyncResult r = sync_check(dir);
+            return [this, r] { if (!r.text.empty()) message = r.text; };
+        });
+    }
+
+    void repo_pull() {
+        message = "Pulling the music repo…";
+        run_repo([this] {
+            SyncResult r = sync_pull(dir);
+            return [this, r] {
+                message = r.text;
+                if (r.ok && r.repo) load();  // pick up new songs and playlists
+            };
+        });
+    }
+
+    void repo_push() {
+        note_progress();
+        save_progress(true);
+        message = "Pushing the music repo…";
+        run_repo([this] {
+            SyncResult r = sync_push(dir);
+            return [this, r] { message = r.text; };
+        });
+    }
+
     // Called once on quit.
     void shutdown() {
+        if (repo_thread.joinable()) repo_thread.join();
         note_progress();
         save_progress(true);
     }
@@ -2155,6 +2221,8 @@ struct App {
             load();
             message = "Found " + plural(tracks.size(), "song");
         }
+        else if (verb == "pull") repo_pull();
+        else if (verb == "push") repo_push();
         else if (verb == "shuffle") toggle_shuffle();
         else if (verb == "speed") {
             double s = std::atof(arg.c_str());
@@ -2252,6 +2320,7 @@ struct App {
     bool on_event(const Event& e) {
         bool handled = handle_event(e);
         check_download();  // after the key too, in case it just closed a prompt
+        check_repo();
         check_shrink();
         check_order();
         return handled;
@@ -2898,6 +2967,7 @@ struct App {
             line(":new :rename", ":new Name  :rename Name  :delete"),
             heading("Other computers  (⇣ = not downloaded here)"),
             line("Enter on ⇣", "download that song"),
+            line(":pull / :push", "pull the music repo / commit and push your changes"),
             line(":sync", "download every missing song"),
             line(":sync album", "download the selected album's missing songs"),
             line(":sync artist", "download the selected artist's missing songs"),
@@ -2991,8 +3061,6 @@ int main(int argc, char** argv) {
     // A full, clean path, so song paths always look the same (playlists match them).
     dir = fs::weakly_canonical(fs::absolute(dir));
 
-    sync_on_start(dir);
-
     auto screen = ScreenInteractive::Fullscreen();
     // The player and downloader call this from their own threads; PostEvent
     // is thread-safe and makes FTXUI wake up and redraw.
@@ -3005,6 +3073,7 @@ int main(int argc, char** argv) {
 
     App app(dir, player, downloader, screen);
     app.load();
+    app.start_repo_check();  // in the background, so launching stays fast
 
     auto ui = Renderer([&] { return app.draw(); });
     ui |= CatchEvent([&](Event e) { return app.on_event(e); });

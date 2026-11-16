@@ -55,9 +55,11 @@ Check it with `ls -l ~/.local/bin/crate`, and remove it with `rm ~/.local/bin/cr
 
 ## Keeping the music repo in sync
 
-If the library folder is itself a git repo with a remote (it only tracks `library.tsv`, `progress.tsv` and playlists), crate checks it for you:
+If the library folder is itself a git repo with a remote (it only tracks `library.tsv`, `progress.tsv` and playlists), crate helps keep it in step:
 
-- On launch it fetches, and if the remote has new commits it lists them and asks `Pull them now? [Y/n]`.
-- After you quit it checks for uncommitted changes or unpushed commits and asks `Commit and push them now? [Y/n]`.
+- On launch it fetches in the background. If the remote has new commits, the status bar says so.
+- `:pull` pulls them (keeping your uncommitted edits) and reloads the library.
+- `:push` commits whatever changed in crate and pushes it.
+- After you quit, if anything is uncommitted or unpushed, it asks `Commit and push them now? [Y/n]` in the terminal.
 
-Both prompts appear in the terminal outside the UI. They are skipped when the folder isn't a repo, has no upstream, or there's no terminal. If the remote can't be reached, crate carries on offline.
+Nothing happens when the folder isn't a repo or has no upstream. If the remote can't be reached, crate carries on offline.

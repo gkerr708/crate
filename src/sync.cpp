@@ -75,7 +75,7 @@ bool pull(const std::filesystem::path& dir, std::string& error) {
     if (p.code == 0 && !has_conflicts(dir)) return true;
     if (has_conflicts(dir)) {
         git(dir, "reset --hard --quiet HEAD");
-        error = "your local edits clash with the remote's. They're saved in the stash (git stash pop).";
+        error = "edits clash; yours are in git stash";
     } else {
         error = p.out;
     }
@@ -86,36 +86,102 @@ std::string plural(int n, const char* what) { return std::to_string(n) + " " + w
 
 }  // namespace
 
-void sync_on_start(const std::filesystem::path& dir) {
-    if (!interactive() || !is_repo(dir) || !has_upstream(dir)) return;
-    std::cout << "Checking the music repo for changes…" << std::flush;
-    Result f = git(dir, "fetch --quiet", 10);
-    std::cout << "\r\033[K";
-    if (f.code != 0) {
-        std::cout << "crate: couldn't reach the music repo's remote (continuing offline)\n";
-        return;
+SyncResult sync_check(const std::filesystem::path& dir) {
+    SyncResult r;
+    if (!is_repo(dir) || !has_upstream(dir)) {
+        r.repo = false;
+        return r;
+    }
+    if (git(dir, "fetch --quiet", 8).code != 0) {
+        r.ok = false;
+        r.text = "Couldn't reach the music repo's remote";
+        return r;
+    }
+    r.behind = count(dir, "HEAD..@{u}");
+    if (r.behind > 0) r.text = "Music repo: " + plural(r.behind, "new commit") + " on the remote. :pull to get them";
+    return r;
+}
+
+SyncResult sync_pull(const std::filesystem::path& dir) {
+    SyncResult r;
+    if (!is_repo(dir) || !has_upstream(dir)) {
+        r.repo = false;
+        r.ok = false;
+        r.text = "The music folder isn't a git repo with a remote";
+        return r;
+    }
+    if (git(dir, "fetch --quiet", 15).code != 0) {
+        r.ok = false;
+        r.text = "Couldn't reach the music repo's remote";
+        return r;
     }
     int behind = count(dir, "HEAD..@{u}");
-    if (behind == 0) return;
-
-    std::cout << "The music repo has " << plural(behind, "new commit") << " on the remote:\n";
-    Result log = git(dir, "log --format='  %s' -n 5 HEAD..@{u}");
-    if (!log.out.empty()) std::cout << log.out << "\n";
-    if (behind > 5) std::cout << "  …and " << behind - 5 << " more\n";
-    if (!ask("Pull them now?")) return;
-
+    if (behind == 0) {
+        r.text = "Music repo is already up to date";
+        return r;
+    }
     std::string err;
-    if (pull(dir, err)) std::cout << "Pulled.\n";
-    else std::cout << "crate: pull failed: " << err << "\n";
+    if (pull(dir, err)) {
+        r.text = "Pulled " + plural(behind, "commit");
+    } else {
+        r.ok = false;
+        r.text = "Pull failed: " + err;
+    }
+    return r;
+}
+
+SyncResult sync_push(const std::filesystem::path& dir) {
+    SyncResult r;
+    if (!is_repo(dir) || !has_upstream(dir)) {
+        r.repo = false;
+        r.ok = false;
+        r.text = "The music folder isn't a git repo with a remote";
+        return r;
+    }
+    if (has_conflicts(dir)) {
+        r.ok = false;
+        r.text = "The music repo has unresolved merge conflicts; fix them with git first";
+        return r;
+    }
+    bool dirty = !git(dir, "status --porcelain").out.empty();
+    if (!dirty && count(dir, "@{u}..HEAD") == 0) {
+        r.text = "Nothing to push";
+        return r;
+    }
+    if (dirty) {
+        Result a = git(dir, "add -A");
+        Result c = a.code == 0 ? git(dir, "commit --quiet -m 'Update library (crate)'") : a;
+        if (c.code != 0) {
+            r.ok = false;
+            r.text = "Commit failed: " + c.out;
+            return r;
+        }
+    }
+    Result p = git(dir, "push --quiet");
+    if (p.code == 0) {
+        r.text = "Pushed";
+        return r;
+    }
+    // Probably behind the remote: rebase on it and try once more.
+    std::string err;
+    if (pull(dir, err)) p = git(dir, "push --quiet");
+    else p.out = err;
+    if (p.code == 0) {
+        r.text = "Pulled the remote's changes and pushed";
+    } else {
+        r.ok = false;
+        r.text = "Push failed: " + p.out;
+    }
+    return r;
 }
 
 void sync_on_exit(const std::filesystem::path& dir) {
     if (!interactive() || !is_repo(dir) || !has_upstream(dir)) return;
-    // Ignored files (the audio) don't show up here, only what the repo tracks.
     if (has_conflicts(dir)) {
         std::cout << "crate: the music repo has unresolved merge conflicts; fix them with git first.\n";
         return;
     }
+    // Ignored files (the audio) don't show up here, only what the repo tracks.
     Result st = git(dir, "status --porcelain");
     int ahead = count(dir, "@{u}..HEAD");
     if (st.out.empty() && ahead == 0) return;
@@ -124,23 +190,6 @@ void sync_on_exit(const std::filesystem::path& dir) {
     if (ahead > 0) std::cout << "It also has " << plural(ahead, "commit") << " not pushed yet.\n";
     if (!ask(st.out.empty() ? "Push them now?" : "Commit and push them now?")) return;
 
-    if (!st.out.empty()) {
-        Result a = git(dir, "add -A");
-        Result c = a.code == 0 ? git(dir, "commit --quiet -m 'Update library (crate)'") : a;
-        if (c.code != 0) {
-            std::cout << "crate: commit failed:\n" << c.out << "\n";
-            return;
-        }
-    }
-    Result p = git(dir, "push --quiet");
-    if (p.code == 0) {
-        std::cout << "Pushed.\n";
-        return;
-    }
-    // Probably behind the remote: rebase on it and try once more.
-    std::string err;
-    if (pull(dir, err)) p = git(dir, "push --quiet");
-    else p.out = err;
-    if (p.code == 0) std::cout << "Pulled the remote's changes and pushed.\n";
-    else std::cout << "crate: push failed: " << p.out << "\n";
+    SyncResult r = sync_push(dir);
+    std::cout << (r.ok ? "" : "crate: ") << r.text << (r.ok ? ".\n" : "\n");
 }

@@ -1236,12 +1236,16 @@ struct App {
         message = "Downloaded " + title + (left ? " (" + std::to_string(left) + " to go)" : "");
     }
 
-    // :sync [artist|album]: download the missing songs of the whole
-    // library, the selected artist, or the selected album / playlist.
+    // :sync [all|artist|album]: download the missing songs of what's
+    // selected (song(s), artist or album, by pane), the selected artist or
+    // album / playlist, or with `all` the whole library.
     void sync(const std::string& scope) {
         std::vector<int> picked;  // indices into `tracks`
         std::string where;
-        if (scope.empty() || scope == "all") {
+        if (scope.empty()) {
+            picked = selected_tracks(where);
+            if (picked.empty()) return;
+        } else if (scope == "all") {
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i) picked.push_back(i);
             where = "library.tsv";
         } else if (scope == "artist") {
@@ -1270,7 +1274,7 @@ struct App {
             }
             where = g.label;
         } else {
-            message = "Usage: :sync [artist|album]  (no argument syncs everything)";
+            message = "Usage: :sync [all|artist|album]  (no argument syncs the selection)";
             return;
         }
         std::vector<std::string> missing;
@@ -2968,7 +2972,8 @@ struct App {
             heading("Other computers  (⇣ = not downloaded here)"),
             line("Enter on ⇣", "download that song"),
             line(":pull / :push", "pull the music repo / commit and push your changes"),
-            line(":sync", "download every missing song"),
+            line(":sync", "download the selected song(s), album or artist"),
+            line(":sync all", "download every missing song"),
             line(":sync album", "download the selected album's missing songs"),
             line(":sync artist", "download the selected artist's missing songs"),
             line(":podcast [on|off]", "mark the selected song / album / artist as a podcast"),

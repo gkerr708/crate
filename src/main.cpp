@@ -115,6 +115,7 @@ struct TagForm {
     std::string fields[4];   // what's typed in each field (Podcast's is unused)
     int field = Title;       // the field being edited
     int pick = -1;           // highlighted suggestion; -1 = use what's typed
+    int cursor = -1;         // byte offset of the text cursor in the field; -1 = at the end
     std::string source;      // URL it was downloaded from
     bool podcast = false;    // the Podcast toggle; ap starts it on
     // aS / aA / aP: nothing was downloaded. Saving only lists the song(s) in
@@ -228,6 +229,21 @@ static void pop_char(std::string& s) {
     if (!s.empty()) s.pop_back();
 }
 
+// Byte offsets of the UTF-8 character boundaries before / after `pos`.
+static int prev_boundary(const std::string& s, int pos) {
+    if (pos <= 0) return 0;
+    --pos;
+    while (pos > 0 && (s[pos] & 0xC0) == 0x80) --pos;
+    return pos;
+}
+static int next_boundary(const std::string& s, int pos) {
+    int n = static_cast<int>(s.size());
+    if (pos >= n) return n;
+    ++pos;
+    while (pos < n && (s[pos] & 0xC0) == 0x80) ++pos;
+    return pos;
+}
+
 struct App {
     fs::path dir;
     Player& player;
@@ -308,6 +324,14 @@ struct App {
     // --- playback ---
     std::vector<int> queue;  // what we're playing through (indices into tracks)
     int queue_pos = -1;
+    // Up next: the queue after queue_pos. Songs you add with Q go right after
+    // the playing one, in order; queued_n counts them so the next Q lands
+    // after them, and so a new list or shuffle leaves them be.
+    int queued_n = 0;
+    bool show_queue = false;  // the Up next popup
+    Cursor q_cur;
+    int q_visual = -1;        // V in the popup: where the selection started
+    int q_rows = 10;          // visible list rows in the popup; updated every draw
     int playing = -1;        // index into tracks, -1 if nothing
     bool shuffle = false;
     std::mt19937 rng{std::random_device{}()};
@@ -354,6 +378,9 @@ struct App {
     // =================================================================
     void load() {
         std::string playing_path = playing >= 0 ? tracks[playing].path.string() : "";
+        std::vector<std::string> old_queue;  // keep what's queued across a rescan
+        for (int i : queue) old_queue.push_back(tracks[i].path.string());
+        int old_pos = queue_pos;
         tracks = scan_library(dir);
         library_bytes = folder_size(dir);
         merge_manifest();
@@ -388,8 +415,24 @@ struct App {
         // Indices changed, so find the playing song again by its path.
         auto it = track_index.find(playing_path);
         playing = it == track_index.end() ? -1 : it->second;
-        queue = songs;
-        queue_pos = index_of(queue, playing);
+        if (old_queue.empty()) {
+            queue = songs;
+            queue_pos = index_of(queue, playing);
+            queued_n = 0;
+        } else {
+            queue.clear();
+            queue_pos = -1;
+            for (int i = 0; i < static_cast<int>(old_queue.size()); ++i) {
+                auto found = track_index.find(old_queue[i]);
+                if (found == track_index.end()) {  // gone: if it was the playing one, stay just before it
+                    if (i == old_pos) queue_pos = static_cast<int>(queue.size()) - 1;
+                    continue;
+                }
+                if (i == old_pos) queue_pos = static_cast<int>(queue.size());
+                queue.push_back(found->second);
+            }
+            normalize_queue();
+        }
 
         if (tracks.empty()) message = "No audio files found in " + dir.string();
     }
@@ -786,17 +829,37 @@ struct App {
             restore({rel(tracks[songs[list_pos]].path)});
             return;
         }
+        std::vector<int> keep = take_queued();
         queue = songs;
         queue_pos = list_pos;
+        queued_n = 0;
         if (shuffle) shuffle_rest();
+        put_queued(keep);
         start(queue[queue_pos]);
     }
 
+    // Songs added with Q that haven't played yet, taken out of the queue so a
+    // new list can go round them.
+    std::vector<int> take_queued() {
+        normalize_queue();
+        if (queue_pos < 0 || queued_n == 0) return {};
+        return {queue.begin() + queue_pos + 1, queue.begin() + queue_pos + 1 + queued_n};
+    }
+    void put_queued(const std::vector<int>& keep) {
+        queue.insert(queue.begin() + queue_pos + 1, keep.begin(), keep.end());
+        queued_n = static_cast<int>(keep.size());
+    }
+
+    // The first song of up next, in `queue`.
+    int up_base() const { return queue_pos + 1; }
+    int up_size() const { return std::max(0, static_cast<int>(queue.size()) - up_base()); }
+    void normalize_queue() { queued_n = std::clamp(queued_n, 0, up_size()); }
+
     // Shuffle everything after the current song.
     void shuffle_rest() {
-        if (queue_pos + 1 < static_cast<int>(queue.size())) {
-            std::shuffle(queue.begin() + queue_pos + 1, queue.end(), rng);
-        }
+        normalize_queue();
+        int from = queue_pos + 1 + queued_n;  // what you queued stays in order
+        if (from < static_cast<int>(queue.size())) std::shuffle(queue.begin() + from, queue.end(), rng);
     }
 
     void next() {
@@ -804,6 +867,7 @@ struct App {
         while (queue_pos + 1 < static_cast<int>(queue.size()) && tracks[queue[queue_pos + 1]].missing) ++queue_pos;
         if (queue_pos + 1 < static_cast<int>(queue.size())) {
             start(queue[++queue_pos]);
+            if (queued_n > 0) --queued_n;
         } else {
             player.stop();
             playing = -1;
@@ -829,11 +893,186 @@ struct App {
             shuffle_rest();
         } else if (playing >= 0) {
             // Back to list order, carrying on from the current song.
+            std::vector<int> keep = take_queued();
             queue = songs;
             queue_pos = index_of(queue, playing);
             if (queue_pos < 0) { queue = {playing}; queue_pos = 0; }
+            put_queued(keep);
         }
         message = shuffle ? "Shuffle on" : "Shuffle off";
+    }
+
+    // =================================================================
+    // Up next
+    // =================================================================
+    // Q in the songs pane: queue the selected song(s) after the playing one
+    // (and after anything queued before them).
+    void add_to_queue(int n) {
+        std::vector<int> add;
+        int skipped = 0;
+        auto [lo, hi] = row_range(n);
+        for (int i = lo; i <= hi; ++i) {
+            if (tracks[songs[i]].missing) ++skipped;
+            else add.push_back(songs[i]);
+        }
+        visual = -1;
+        if (add.empty()) {
+            message = "Not downloaded here yet (⇣): :sync it first";
+            return;
+        }
+        if (playing >= 0 && queue_pos < 0) {  // the queue lost track of the playing song
+            queue.insert(queue.begin(), playing);
+            queue_pos = 0;
+        }
+        normalize_queue();
+        queue.insert(queue.begin() + up_base() + queued_n, add.begin(), add.end());
+        queued_n += static_cast<int>(add.size());
+        message = "Up next: added " + plural(add.size(), "song") + " (u shows the list)" +
+                  (skipped ? " · " + std::to_string(skipped) + " not downloaded, skipped" : "");
+    }
+
+    // The selected rows of the popup, as offsets into up next.
+    std::pair<int, int> q_range(int n) const {
+        int last = up_size() - 1;
+        if (q_visual >= 0) return {std::min(q_visual, q_cur.sel), std::min(std::max(q_visual, q_cur.sel), last)};
+        return {q_cur.sel, std::min(q_cur.sel + n - 1, last)};
+    }
+
+    void q_paths(std::pair<int, int> r) {
+        yanked.clear();
+        for (int i = r.first; i <= r.second; ++i) yanked.push_back(tracks[queue[up_base() + i]].path);
+    }
+
+    void q_yank(int n) {
+        if (up_size() == 0) return;
+        q_paths(q_range(n));
+        q_visual = -1;
+        message = "Yanked " + plural(yanked.size(), "song") + " (p puts them here or in a playlist)";
+    }
+
+    void q_delete(int n) {
+        if (up_size() == 0) return;
+        auto r = q_range(n);
+        q_paths(r);  // like vim, deleting also yanks
+        queue.erase(queue.begin() + up_base() + r.first, queue.begin() + up_base() + r.second + 1);
+        q_cur.sel = r.first;
+        q_visual = -1;
+        queued_n -= std::clamp(queued_n - r.first, 0, r.second - r.first + 1);  // those were queued ones
+        normalize_queue();
+        message = "Removed " + plural(yanked.size(), "song") + " from up next (p puts them back)";
+    }
+
+    // D: remove everything from the cursor to the end.
+    void q_delete_rest() {
+        if (up_size() == 0) return;
+        q_visual = -1;
+        q_delete(up_size() - q_cur.sel);
+    }
+
+    void q_put(bool before) {
+        std::vector<int> add;
+        for (const fs::path& path : yanked)
+            if (auto it = track_index.find(path.string()); it != track_index.end()) add.push_back(it->second);
+        if (add.empty()) {
+            message = "Nothing yanked yet (yy copies a song, dd cuts it)";
+            return;
+        }
+        if (playing >= 0 && queue_pos < 0) {
+            queue.insert(queue.begin(), playing);
+            queue_pos = 0;
+        }
+        int at = up_size() == 0 ? 0 : std::clamp(q_cur.sel + (before ? 0 : 1), 0, up_size());
+        queue.insert(queue.begin() + up_base() + at, add.begin(), add.end());
+        if (at < queued_n) queued_n += static_cast<int>(add.size());  // put among the queued ones
+        q_cur.sel = at;
+        q_visual = -1;
+        message = "Put " + plural(add.size(), "song") + " in up next";
+    }
+
+    // J / K: move the selected song(s) down / up one place.
+    void q_move(int dir) {
+        if (up_size() == 0) return;
+        auto [lo, hi] = q_range(1);
+        if (dir > 0 ? hi + 1 >= up_size() : lo == 0) return;
+        auto first = queue.begin() + up_base();
+        if (dir > 0) std::rotate(first + lo, first + hi + 1, first + hi + 2);
+        else std::rotate(first + lo - 1, first + lo, first + hi + 1);
+        q_cur.sel += dir;
+        if (q_visual >= 0) q_visual += dir;
+    }
+
+    // Enter: play the selected song now; what was before it is skipped.
+    void q_play() {
+        if (up_size() == 0) return;
+        int i = up_base() + q_cur.sel;
+        if (tracks[queue[i]].missing) {
+            restore({rel(tracks[queue[i]].path)});
+            return;
+        }
+        queued_n = std::max(0, queued_n - (q_cur.sel + 1));
+        queue_pos = i;
+        start(queue[i]);
+        q_cur.sel = 0;
+        q_visual = -1;
+    }
+
+    void q_move_to(int index) { q_cur.sel = std::clamp(index, 0, std::max(0, up_size() - 1)); }
+
+    bool on_queue_key(const Event& e) {
+        message.clear();
+        std::string c = e.is_character() ? e.character() : "";
+        if (c.size() == 1 && std::isdigit(static_cast<unsigned char>(c[0])) && (c != "0" || count > 0)) {
+            count = count * 10 + (c[0] - '0');
+            return true;
+        }
+        bool has_count = count > 0;
+        int n = has_count ? count : 1;
+        count = 0;
+
+        if (pending) {  // second key of gg / yy / dd
+            char first = pending;
+            int first_count = pending_count;
+            pending = 0;
+            if (first == 'g' && c == "g") q_move_to(first_count ? first_count - 1 : 0);
+            if (first == 'y' && c == "y") q_yank(std::max(1, first_count));
+            if (first == 'd' && c == "d") q_delete(std::max(1, first_count));
+            return true;
+        }
+        auto start_pending = [&](char key) {
+            pending = key;
+            pending_count = has_count ? n : 0;
+        };
+
+        if (c == "j" || e == Event::ArrowDown) q_move_to(q_cur.sel + n);
+        else if (c == "k" || e == Event::ArrowUp) q_move_to(q_cur.sel - n);
+        else if (c == "g") start_pending('g');
+        else if (c == "G") q_move_to(has_count ? n - 1 : up_size() - 1);
+        else if (e == Event::CtrlD) q_move_to(q_cur.sel + q_rows / 2);
+        else if (e == Event::CtrlU) q_move_to(q_cur.sel - q_rows / 2);
+        else if (e == Event::CtrlF || e == Event::PageDown) q_move_to(q_cur.sel + q_rows);
+        else if (e == Event::CtrlB || e == Event::PageUp) q_move_to(q_cur.sel - q_rows);
+        else if (e == Event::Home) q_move_to(0);
+        else if (e == Event::End) q_move_to(up_size() - 1);
+        else if (c == "V") q_visual = q_visual >= 0 || up_size() == 0 ? -1 : q_cur.sel;
+        else if (c == "y") q_visual >= 0 ? q_yank(1) : start_pending('y');
+        else if (c == "d") q_visual >= 0 ? q_delete(1) : start_pending('d');
+        else if (c == "x" || e == Event::Delete) q_delete(n);
+        else if (c == "D") q_delete_rest();
+        else if (c == "p") q_put(false);
+        else if (c == "P") q_put(true);
+        else if (c == "J") q_move(+1);
+        else if (c == "K") q_move(-1);
+        else if (e == Event::Return) q_play();
+        // the playback keys keep working under the popup
+        else if (c == " ") player.toggle_pause();
+        else if (c == "]") next();
+        else if (c == "[") prev();
+        else if (e == Event::Escape) {
+            if (q_visual >= 0) q_visual = -1;
+            else show_queue = false;
+        }
+        else if (c == "q" || c == "u") show_queue = false;
+        return true;
     }
 
     // Move the cursor to the playing song, clearing filters if needed.
@@ -2140,6 +2379,7 @@ struct App {
         auto go_to_field = [&](int f) {
             commit_field();
             form.field = std::clamp(f, first, last);
+            form.cursor = -1;
         };
 
         if (e == Event::Escape) cancel_form();
@@ -2160,23 +2400,43 @@ struct App {
         // stepping past either end goes back to what you typed.
         else if (e == Event::CtrlN || e == Event::ArrowDown) {
             if (n_sugg) form.pick = form.pick + 1 < n_sugg ? form.pick + 1 : -1;
+            form.cursor = -1;
         }
         else if (e == Event::CtrlP || e == Event::ArrowUp) {
             if (n_sugg) form.pick = form.pick < 0 ? n_sugg - 1 : form.pick - 1;
+            form.cursor = -1;
         }
-        else if (e == Event::Backspace) {
-            std::string v = form_value();
-            pop_char(v);
-            form.fields[form.field] = v;
-            form.pick = -1;
-        }
-        else if (e == Event::CtrlU) {  // clear the field, as in a shell
-            form.fields[form.field].clear();
-            form.pick = -1;
-        }
-        else if (e.is_character()) {
-            form.fields[form.field] = form_value() + e.character();
-            form.pick = -1;
+        else if (e == Event::Backspace || e == Event::Delete || e == Event::ArrowLeft || e == Event::ArrowRight ||
+                 e == Event::Home || e == Event::End || e == Event::CtrlA || e == Event::CtrlE ||
+                 e == Event::CtrlU || e.is_character()) {
+            // Editing works on what's typed, so a highlighted suggestion becomes the text first.
+            if (form.pick >= 0) {
+                form.fields[form.field] = form_value();
+                form.pick = -1;
+                form.cursor = -1;
+            }
+            std::string& v = form.fields[form.field];
+            int len = static_cast<int>(v.size());
+            int pos = form.cursor < 0 ? len : std::min(form.cursor, len);
+            if (e == Event::ArrowLeft) pos = prev_boundary(v, pos);
+            else if (e == Event::ArrowRight) pos = next_boundary(v, pos);
+            else if (e == Event::Home || e == Event::CtrlA) pos = 0;
+            else if (e == Event::End || e == Event::CtrlE) pos = len;
+            else if (e == Event::Backspace) {
+                int from = prev_boundary(v, pos);
+                v.erase(from, pos - from);
+                pos = from;
+            }
+            else if (e == Event::Delete) v.erase(pos, next_boundary(v, pos) - pos);
+            else if (e == Event::CtrlU) {  // clear the field, as in a shell
+                v.clear();
+                pos = 0;
+            }
+            else {
+                v.insert(pos, e.character());
+                pos += static_cast<int>(e.character().size());
+            }
+            form.cursor = pos;
         }
         return true;
     }
@@ -2225,6 +2485,7 @@ struct App {
             load();
             message = "Found " + plural(tracks.size(), "song");
         }
+        else if (verb == "queue" || verb == "upnext") show_queue = true;
         else if (verb == "pull") repo_pull();
         else if (verb == "push") repo_push();
         else if (verb == "shuffle") toggle_shuffle();
@@ -2350,6 +2611,7 @@ struct App {
             show_help = false;
             return;
         }
+        if (show_queue) return;  // double tap or q closes it
         if (mode != Mode::Normal) return;
         message.clear();
         if (now_box.Contain(x, y)) {
@@ -2372,6 +2634,10 @@ struct App {
         if (mode != Mode::Normal) return false;
 
         if (wheel) {
+            if (show_queue) {
+                q_move_to(q_cur.sel + (m.button == Mouse::WheelDown ? 1 : -1));
+                return true;
+            }
             int p = pane_at(m.x, m.y);
             if (show_help || p < 0) return false;
             set_pane(p);
@@ -2408,6 +2674,7 @@ struct App {
         tap_timer.request_stop();
         taps = 0;
         if (show_help) show_help = false;
+        else if (show_queue) show_queue = false;
         else set_pane(static_cast<int>(pane) - 1);
         return true;
     }
@@ -2438,6 +2705,7 @@ struct App {
             else message = "Cancelled";
             return true;
         }
+        if (mode == Mode::Normal && show_queue) return on_queue_key(e);
         if (mode != Mode::Normal) return on_input_key(e);
         message.clear();
 
@@ -2536,6 +2804,8 @@ struct App {
         else if (c == "p") songs_only([&] { put(false); });
         else if (c == "P") songs_only([&] { put(true); });
         else if (c == "A") songs_only([&] { begin_pick(n); });
+        else if (c == "Q") songs_only([&] { add_to_queue(n); });
+        else if (c == "u") { show_queue = true; q_visual = -1; }
         else if (c == "J") songs_only([&] { move_song(+1); });
         else if (c == "K") songs_only([&] { move_song(-1); });
 
@@ -2795,6 +3065,10 @@ struct App {
         } else if (mode == Mode::Confirm) {
             mode_tag = tag("CONFIRM", Color::Red);
             rest = text(" " + confirm_text) | bold;
+        } else if (show_queue) {
+            mode_tag = tag(q_visual >= 0 ? "UP NEXT VISUAL" : "UP NEXT", q_visual >= 0 ? Color::RedLight : Color::Cyan);
+            std::string keys = (count > 0 ? std::to_string(count) : "") + (pending ? std::string(1, pending) : "");
+            rest = text(" " + (message.empty() ? keys : message));
         } else {
             mode_tag = visual >= 0 ? tag("VISUAL", Color::RedLight) : tag("NORMAL", Color::Green);
             std::string keys = (count > 0 ? std::to_string(count) : "") +
@@ -2868,7 +3142,12 @@ struct App {
             bool active = i == form.field;
             std::string value = active ? form_value() : form.fields[i];
             Element label = text(std::string(active ? "› " : "  ") + labels[i]) | size(WIDTH, EQUAL, 10);
-            Element field = text(value + (active ? "▏" : ""));
+            Element field = text(value);
+            if (active) {
+                int pos = form.cursor < 0 || form.pick >= 0 ? static_cast<int>(value.size())
+                                                            : std::min(form.cursor, static_cast<int>(value.size()));
+                field = hbox({text(value.substr(0, pos)), text("▏"), text(value.substr(pos))});
+            }
             if (value.empty() && !active) field = text("—") | dim;
             lines.push_back(active ? hbox({label | color(Color::Green) | bold, field | bold})
                                    : hbox({label | dim, field}));
@@ -2928,6 +3207,52 @@ struct App {
                size(WIDTH, EQUAL, 56) | clear_under | center;
     }
 
+    Element draw_queue() {
+        q_rows = std::clamp(Terminal::Size().dimy - 12, 3, 20);
+        normalize_queue();
+        int n_up = up_size();
+        q_cur.fit(n_up, q_rows);
+        int width = std::min(cols - 2, 72);
+
+        int total = 0;
+        for (int i = 0; i < n_up; ++i) total += tracks[queue[up_base() + i]].seconds;
+        Elements lines;
+        if (playing >= 0) {
+            const Track& t = tracks[playing];
+            lines.push_back(hbox({text(" ▶ ") | color(Color::Green), text(t.title) | bold | flex,
+                                  text(" " + t.artist + " ") | dim}));
+        } else {
+            lines.push_back(text(" Nothing playing") | dim);
+        }
+        lines.push_back(separator());
+        if (n_up == 0) {
+            lines.push_back(text(" Nothing up next.") | dim);
+            lines.push_back(text(" Press Q on a song to add it.") | dim);
+        }
+        auto [lo, hi] = q_visual >= 0 ? q_range(1) : std::pair{-1, -1};
+        for (int i = q_cur.top; i < std::min(n_up, q_cur.top + q_rows); ++i) {
+            const Track& t = tracks[queue[up_base() + i]];
+            char num[16];
+            std::snprintf(num, sizeof num, " %3d ", i + 1);
+            Element number = text(num) | dim;
+            if (i < queued_n) number = text(num) | color(Color::Cyan);
+            Element row = hbox({number,
+                                text(t.missing ? "⇣ " + t.title : t.title) | flex,
+                                (width >= 60 ? text(" " + t.artist) | size(WIDTH, LESS_THAN, 20) | dim : text("")),
+                                text(" " + format_time(t.seconds) + " ") | dim});
+            if (t.missing) row = row | dim;
+            if (i == q_cur.sel) row = row | inverted;
+            else if (i >= lo && i <= hi) row = row | bgcolor(Color::GrayDark);
+            lines.push_back(row);
+        }
+        lines.push_back(separator());
+        lines.push_back(text(" " + plural(n_up, "song") + (n_up ? " · " + format_time(total) : "") +
+                             (queued_n ? " · " + std::to_string(queued_n) + " queued" : "")) | dim);
+        lines.push_back(text(" dd cut · yy copy · p/P put · J/K move · Enter play · Esc") | dim);
+        return window(text(" Up next ") | bold | color(Color::Cyan), vbox(std::move(lines))) |
+               size(WIDTH, EQUAL, width) | clear_under | center;
+    }
+
     Element draw_help() const {
         auto line = [](std::string keys, std::string what) {
             return hbox({text(keys) | color(Color::Green) | size(WIDTH, EQUAL, 18), text(what)});
@@ -2950,6 +3275,10 @@ struct App {
             line("+ / -   s", "volume   shuffle"),
             line("v / b / i", "mini / big spectrum, now playing"),
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
+            heading("Up next"),
+            line("Q", "queue the selected song(s) after the playing one"),
+            line("u  :queue", "show the list; there dd / yy / p / P / J / K / V work like in a playlist"),
+            line("Enter / D", "in it: play this one now / remove from here to the end"),
             heading("Library"),
             line("as / aa / ap", "add a song / an album (playlist) / a podcast from a URL"),
             line("e", "edit tags (or rename the artist / album)"),
@@ -3048,6 +3377,7 @@ struct App {
         if (mode == Mode::Tag) return dbox({main, draw_form()});
         if (mode == Mode::Pick) return dbox({main, draw_picker()});
         if (show_help) return dbox({main, draw_help()});
+        if (show_queue) return dbox({main, draw_queue()});
         return main;
     }
 };

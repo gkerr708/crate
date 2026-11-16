@@ -8,6 +8,8 @@
 #include <fstream>
 #include <tuple>
 
+#include <string_view>
+
 #include <taglib/fileref.h>
 #include <taglib/tag.h>
 
@@ -15,6 +17,17 @@ namespace fs = std::filesystem;
 
 std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Lowercased, with a leading "the ", "a " or "an " dropped, so "The Acacia
+// Strain" files under A like in a record shop.
+static std::string sort_name(const std::string& name) {
+    std::string s = lower(name);
+    for (const char* article : {"the ", "an ", "a "}) {
+        std::string_view a = article;
+        if (s.size() > a.size() && s.compare(0, a.size(), a) == 0) return s.substr(a.size());
+    }
     return s;
 }
 
@@ -160,7 +173,8 @@ std::vector<Track> scan_library(const fs::path& dir) {
 void sort_tracks(std::vector<Track>& tracks) {
     // Sort with a tuple: compares artist first, then album, and so on.
     std::sort(tracks.begin(), tracks.end(), [](const Track& a, const Track& b) {
-        return std::tuple(lower(a.artist), lower(a.album), a.number, lower(a.title)) <
-               std::tuple(lower(b.artist), lower(b.album), b.number, lower(b.title));
+        // The raw lowercase name breaks ties so one artist's songs stay together.
+        return std::tuple(sort_name(a.artist), lower(a.artist), sort_name(a.album), lower(a.album), a.number, lower(a.title)) <
+               std::tuple(sort_name(b.artist), lower(b.artist), sort_name(b.album), lower(b.album), b.number, lower(b.title));
     });
 }

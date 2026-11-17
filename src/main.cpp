@@ -905,9 +905,9 @@ struct App {
     // =================================================================
     // Up next
     // =================================================================
-    // Q in the songs pane: queue the selected song(s) after the playing one
-    // (and after anything queued before them).
-    void add_to_queue(int n) {
+    // Q / E in the songs pane: queue the selected song(s) right after the
+    // playing one (Q, ahead of anything queued before), or at the very end (E).
+    void add_to_queue(int n, bool at_end) {
         std::vector<int> add;
         int skipped = 0;
         auto [lo, hi] = row_range(n);
@@ -925,9 +925,14 @@ struct App {
             queue_pos = 0;
         }
         normalize_queue();
-        queue.insert(queue.begin() + up_base() + queued_n, add.begin(), add.end());
-        queued_n += static_cast<int>(add.size());
-        message = "Up next: added " + plural(add.size(), "song") + " (u shows the list)" +
+        if (at_end) {
+            queue.insert(queue.end(), add.begin(), add.end());
+        } else {
+            queue.insert(queue.begin() + up_base(), add.begin(), add.end());
+            queued_n += static_cast<int>(add.size());
+        }
+        message = (at_end ? "Added " + plural(add.size(), "song") + " to the end of up next"
+                          : "Up next: " + plural(add.size(), "song")) + " (u shows the list)" +
                   (skipped ? " · " + std::to_string(skipped) + " not downloaded, skipped" : "");
     }
 
@@ -2804,7 +2809,8 @@ struct App {
         else if (c == "p") songs_only([&] { put(false); });
         else if (c == "P") songs_only([&] { put(true); });
         else if (c == "A") songs_only([&] { begin_pick(n); });
-        else if (c == "Q") songs_only([&] { add_to_queue(n); });
+        else if (c == "Q") songs_only([&] { add_to_queue(n, false); });
+        else if (c == "E") songs_only([&] { add_to_queue(n, true); });
         else if (c == "u") { show_queue = true; q_visual = -1; }
         else if (c == "J") songs_only([&] { move_song(+1); });
         else if (c == "K") songs_only([&] { move_song(-1); });
@@ -3227,7 +3233,7 @@ struct App {
         lines.push_back(separator());
         if (n_up == 0) {
             lines.push_back(text(" Nothing up next.") | dim);
-            lines.push_back(text(" Press Q on a song to add it.") | dim);
+            lines.push_back(text(" Q on a song plays it next, E adds it at the end.") | dim);
         }
         auto [lo, hi] = q_visual >= 0 ? q_range(1) : std::pair{-1, -1};
         for (int i = q_cur.top; i < std::min(n_up, q_cur.top + q_rows); ++i) {
@@ -3276,7 +3282,7 @@ struct App {
             line("v / b / i", "mini / big spectrum, now playing"),
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Up next"),
-            line("Q", "queue the selected song(s) after the playing one"),
+            line("Q / E", "add the selected song(s) up next / at the end of the queue"),
             line("u  :queue", "show the list; there dd / yy / p / P / J / K / V work like in a playlist"),
             line("Enter / D", "in it: play this one now / remove from here to the end"),
             heading("Library"),

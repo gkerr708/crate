@@ -1483,26 +1483,26 @@ struct App {
     // :sync [all|artist|album]: download the missing songs of what's
     // selected (song(s), artist or album, by pane), the selected artist or
     // album / playlist, or with `all` the whole library.
-    void sync(const std::string& scope) {
-        std::vector<int> picked;  // indices into `tracks`
-        std::string where;
+    // Resolve a :sync / :dsync scope to song indices (into `tracks`) and a
+    // name for messages. False (with a message) if nothing was picked.
+    bool pick_scope(const std::string& scope, const char* cmd, std::vector<int>& picked, std::string& where) {
         if (scope.empty()) {
             picked = selected_tracks(where);
-            if (picked.empty()) return;
+            if (picked.empty()) return false;
         } else if (scope == "all") {
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i) picked.push_back(i);
             where = "library.tsv";
         } else if (scope == "artist") {
             if (artist_cur.sel == kAllArtists || artist_cur.sel == kPlaylists) {
                 message = "Select an artist in the artists pane first";
-                return;
+                return false;
             }
             std::string artist = lower(artists[artist_cur.sel]);
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
                 if (lower(tracks[i].artist) == artist) picked.push_back(i);
             where = artists[artist_cur.sel];
         } else if (scope == "album") {
-            if (groups.empty()) { message = "Select an album first"; return; }
+            if (groups.empty()) { message = "Select an album first"; return false; }
             const Group& g = groups[group_cur.sel];
             if (g.kind == Group::List) {
                 for (const fs::path& p : playlists[g.playlist].songs)
@@ -1518,13 +1518,41 @@ struct App {
             }
             where = g.label;
         } else {
-            message = "Usage: :sync [all|artist|album]  (no argument syncs the selection)";
-            return;
+            message = std::string("Usage: :") + cmd + " [all|artist|album]  (no argument uses the selection)";
+            return false;
         }
+        return true;
+    }
+
+    void sync(const std::string& scope) {
+        std::vector<int> picked;
+        std::string where;
+        if (!pick_scope(scope, "sync", picked, where)) return;
         std::vector<std::string> missing;
         for (int i : picked) if (tracks[i].missing) missing.push_back(rel(tracks[i].path));
         if (missing.empty()) message = "Everything in " + where + " is already downloaded";
         else restore(missing);
+    }
+
+    // :dsync [all|artist|album]: the opposite of :sync. Trash the audio
+    // files but keep the songs in library.tsv and playlists as missing (⇣).
+    void dsync(const std::string& scope) {
+        std::vector<int> picked;
+        std::string where;
+        if (!pick_scope(scope, "dsync", picked, where)) return;
+        std::vector<fs::path> paths;
+        int no_link = 0;
+        for (int i : picked) {
+            if (tracks[i].missing) continue;
+            paths.push_back(tracks[i].path);
+            if (tracks[i].source.empty()) ++no_link;
+        }
+        if (paths.empty()) { message = "Nothing in " + where + " is downloaded"; return; }
+        confirm_text = "Remove the downloads of " + where + " (" + plural(paths.size(), "song") +
+                       "), keep them in the library?" +
+                       (no_link ? " " + std::to_string(no_link) + " have no link and can't be redownloaded." : "") + " (y/n)";
+        confirm_action = [this, paths] { really_delete(paths, false); };
+        mode = Mode::Confirm;
     }
 
     // :podcast [on|off]: mark (or unmark) the selected song, album or artist
@@ -2510,6 +2538,7 @@ struct App {
         else if (verb == "rename") rename_playlist(arg);
         else if (verb == "delete") delete_playlist();
         else if (verb == "sync") sync(arg);
+        else if (verb == "dsync") dsync(arg);
         else if (verb == "podcast") mark_podcast(arg);
         else if (verb == "shrink") shrink();
         else if (verb == "order") order_album_tracks();
@@ -3311,6 +3340,7 @@ struct App {
             line(":sync all", "download every missing song"),
             line(":sync album", "download the selected album's missing songs"),
             line(":sync artist", "download the selected artist's missing songs"),
+            line(":dsync [all|album|artist]", "remove the downloads but keep the songs in the library"),
             line(":podcast [on|off]", "mark the selected song / album / artist as a podcast"),
             line(":shrink", "re-encode the selected song / album / artist to 48 kbps"),
             line(":order", "number the selected album's songs in album order (MusicBrainz)"),

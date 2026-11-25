@@ -324,8 +324,8 @@ struct App {
     // --- playback ---
     std::vector<int> queue;  // what we're playing through (indices into tracks)
     int queue_pos = -1;
-    // Up next: the queue after queue_pos. Songs you add with Q go right after
-    // the playing one, in order; queued_n counts them so the next Q lands
+    // Up next: the queue after queue_pos. Songs you add with U go right after
+    // the playing one, in order; queued_n counts them so the next U lands
     // after them, and so a new list or shuffle leaves them be.
     int queued_n = 0;
     bool show_queue = false;  // the Up next popup
@@ -838,7 +838,7 @@ struct App {
         start(queue[queue_pos]);
     }
 
-    // Songs added with Q that haven't played yet, taken out of the queue so a
+    // Songs added with U that haven't played yet, taken out of the queue so a
     // new list can go round them.
     std::vector<int> take_queued() {
         normalize_queue();
@@ -905,8 +905,8 @@ struct App {
     // =================================================================
     // Up next
     // =================================================================
-    // Q / E in the songs pane: queue the selected song(s) right after the
-    // playing one (Q, ahead of anything queued before), or at the very end (E).
+    // U / E in the songs pane: queue the selected song(s) right after the
+    // playing one (U, ahead of anything queued before), or at the very end (E).
     void add_to_queue(int n, bool at_end) {
         std::vector<int> add;
         int skipped = 0;
@@ -2838,7 +2838,7 @@ struct App {
         else if (c == "p") songs_only([&] { put(false); });
         else if (c == "P") songs_only([&] { put(true); });
         else if (c == "A") songs_only([&] { begin_pick(n); });
-        else if (c == "Q") songs_only([&] { add_to_queue(n, false); });
+        else if (c == "U") songs_only([&] { add_to_queue(n, false); });
         else if (c == "E") songs_only([&] { add_to_queue(n, true); });
         else if (c == "u") { show_queue = true; q_visual = -1; }
         else if (c == "J") songs_only([&] { move_song(+1); });
@@ -3262,7 +3262,7 @@ struct App {
         lines.push_back(separator());
         if (n_up == 0) {
             lines.push_back(text(" Nothing up next.") | dim);
-            lines.push_back(text(" Q on a song plays it next, E adds it at the end.") | dim);
+            lines.push_back(text(" U on a song plays it next, E adds it at the end.") | dim);
         }
         auto [lo, hi] = q_visual >= 0 ? q_range(1) : std::pair{-1, -1};
         for (int i = q_cur.top; i < std::min(n_up, q_cur.top + q_rows); ++i) {
@@ -3311,7 +3311,7 @@ struct App {
             line("v / b / i", "mini / big spectrum, now playing"),
             line("> / <  :speed 1.5", "faster / slower (podcasts only, saved per artist)"),
             heading("Up next"),
-            line("Q / E", "add the selected song(s) up next / at the end of the queue"),
+            line("U / E", "add the selected song(s) up next / at the end of the queue"),
             line("u  :queue", "show the list; there dd / yy / p / P / J / K / V work like in a playlist"),
             line("Enter / D", "in it: play this one now / remove from here to the end"),
             heading("Library"),

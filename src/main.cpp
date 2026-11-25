@@ -2285,6 +2285,22 @@ struct App {
                       " · Enter or :sync downloads it";
             return;
         }
+        // A song that isn't downloaded here has no file to tag: change its
+        // entry in library.tsv, and the tags are written when it's downloaded.
+        if (!form.is_new) {
+            if (auto it = track_index.find(form.file.string()); it != track_index.end() && tracks[it->second].missing) {
+                Track& t = tracks[it->second];
+                t.title = title;
+                t.artist = artist.empty() ? "Unknown Artist" : artist;
+                t.album = album;
+                t.podcast = form.podcast;
+                save_manifest();
+                load();
+                select_path(form.file);
+                message = "Saved: " + title + " (not downloaded: the file's tags change when it is)";
+                return;
+            }
+        }
         if (!write_tags(form.file, title, artist, album)) {
             message = "Couldn't write tags to " + form.file.filename().string();
             return;

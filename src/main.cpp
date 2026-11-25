@@ -787,11 +787,28 @@ struct App {
         if (done) done();
     }
 
-    // On launch: fetch, and say in the status bar if the remote has news.
+    // On launch: fetch, and pull in whatever the remote has (your other
+    // machine's new songs and playlists), so the library is up to date.
     void start_repo_check() {
         run_repo([this] {
             SyncResult r = sync_check(dir);
-            return [this, r] { if (!r.text.empty()) message = r.text; };
+            bool pulled = false;
+            if (r.ok && r.repo && r.behind > 0) {
+                SyncResult p = sync_pull(dir);
+                r.text = p.text;
+                r.ok = p.ok;
+                pulled = p.ok;
+            }
+            return [this, r, pulled] {
+                if (pulled) {
+                    load();
+                    int missing = 0;
+                    for (const Track& t : tracks) missing += t.missing;
+                    message = r.text + (missing ? " · " + plural(missing, "song") + " to download: :sync all" : "");
+                } else if (!r.text.empty()) {
+                    message = r.text;
+                }
+            };
         });
     }
 

@@ -58,6 +58,7 @@ Check it with `ls -l ~/.local/bin/crate`, and remove it with `rm ~/.local/bin/cr
 If the library folder is itself a git repo with a remote (it only tracks `library.tsv`, `progress.tsv` and playlists), crate helps keep it in step:
 
 - On launch it fetches in the background and pulls any new commits, so songs you added on another machine show up (as ⇣) right away. `:sync all` then downloads them.
+- `library.tsv` wins over a file's own tags. If you retitle or regroup songs on one machine, the other machine rewrites its downloaded files' tags to match the next time crate loads. (Tag edits made outside crate get reverted.)
 - `:pull` pulls them (keeping your uncommitted edits) and reloads the library.
 - `:push` commits whatever changed in crate and pushes it.
 - After you quit, if anything is uncommitted or unpushed, it asks `Commit and push them now? [Y/n]` in the terminal.

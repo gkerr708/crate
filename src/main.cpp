@@ -471,15 +471,29 @@ struct App {
     void merge_manifest() {
         std::unordered_map<std::string, ManifestEntry> listed;
         for (ManifestEntry& e : read_manifest(dir)) listed[e.path] = std::move(e);
+        int retagged = 0;
 
         for (Track& t : tracks) {
             std::string r = rel(t.path);
             if (auto it = listed.find(r); it != listed.end()) {
-                t.source = it->second.source;
-                t.podcast = it->second.podcast;
-                // A copy whose file has no number (e.g. on another computer
-                // before :order ran there) still sorts by the listed one.
-                if (t.number == 0) t.number = it->second.number;
+                const ManifestEntry& e = it->second;
+                t.source = e.source;
+                t.podcast = e.podcast;
+                // library.tsv is what travels between computers (the audio
+                // doesn't), so it wins over the file's own tags: an edit made
+                // on another machine reaches this copy, and the tags are
+                // rewritten to match.
+                std::string artist = e.artist.empty() ? t.artist : e.artist;
+                std::string title = e.title.empty() ? t.title : e.title;
+                int number = e.number > 0 ? e.number : t.number;
+                if (t.title != title || t.artist != artist || t.album != e.album || t.number != number) {
+                    t.title = title;
+                    t.artist = artist;
+                    t.album = e.album;
+                    t.number = number;
+                    if (write_tags(t.path, t.title, t.artist == "Unknown Artist" ? "" : t.artist, t.album, t.number))
+                        ++retagged;
+                }
                 listed.erase(it);
             }
             if (auto it = pending_sources.find(r); it != pending_sources.end()) t.source = it->second;
@@ -503,6 +517,7 @@ struct App {
         }
         sort_tracks(tracks);
         save_manifest();
+        if (retagged > 0) message = "Updated the tags of " + plural(retagged, "song") + " to match library.tsv";
     }
 
     void save_manifest() {

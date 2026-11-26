@@ -64,7 +64,7 @@ private:
     std::atomic<double> position_{0};
     std::atomic<double> duration_{0};
     std::atomic<bool> paused_{false};
-    std::atomic<double> volume_{70};
+    std::atomic<double> volume_{100};
     std::atomic<bool> finished_{false};
     std::atomic<bool> loading_{false};
 };

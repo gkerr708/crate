@@ -58,7 +58,7 @@ Player::Player(std::function<void()> on_change) : on_change_(std::move(on_change
     // --- Start mpv, with its terminal output thrown away (/dev/null) ---
     std::string ipc = "--input-ipc-server=" + socket_path_;
     const char* argv[] = {"mpv",          "--idle=yes",     "--no-video",
-                          "--no-terminal", "--volume=70",   ipc.c_str(),
+                          "--no-terminal", "--volume=100",   ipc.c_str(),
                           nullptr};
 
     posix_spawn_file_actions_t actions;
